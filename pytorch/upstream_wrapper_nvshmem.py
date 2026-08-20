@@ -60,6 +60,15 @@ XFAIL_WHEN_1GPU_PER_POD = {
     #     "(NVSHMEM getmem needs a registered local MR -> ibrc WC status 4, LOC_PROT_ERR). Passes "
     #     "where the peer is P2P-reachable. Upstream op bug in nvshmem_get_out; see the bug doc."
     # )
+    "test_barrier": (
+        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
+    ),
+    "test_put_wait_signal": (
+        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
+    ),
+    "test_nvshmem_get": (
+        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
+    )
 }
 
 # Asymmetric NVLS tile reduce hangs. Nee NVLS hardware. Also need NVSHMEM_MAX_TEAMS raised.
