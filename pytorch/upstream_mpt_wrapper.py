@@ -33,7 +33,6 @@ import sys
 import threading
 import traceback
 import unittest
-from importlib.util import spec_from_file_location, module_from_spec
 
 import torch
 import torch.distributed as dist
@@ -44,6 +43,45 @@ from testharness import CrossNodeTestHarnessBase
 
 
 OK, SKIP, FAIL = 0, 1, 2
+
+# Classes whose PASS/FAIL is defined by real multi-process spawn semantics. (Child exit codes,
+# SIGABRT from watchdog, flight-recorder dumps). This is not runnable on one-process-per-rank. Skipped.
+BLOCK_CLASSES = {
+    "NCCLTraceTest", "NCCLTraceTestBase", "NCCLTraceTestDumpOnTimeoutBase",
+    "NCCLTraceTestDumpOnTimeout", "NCCLTraceTestDumpOnStuckRanks",
+    "NCCLTraceTestManyRanks", "NcclErrorHandlingTest"
+}
+# Test whose body reaches into the spawn machinery cant' run in-process. Skipped.
+SKIP_SOURCE_MARKERS = (
+    "self.processes", "_check_return_codes", "special_return_code_checks",
+    "skip_return_code_checks", "self._spawn_processes"
+)
+
+# Individual tests that cannot run in the shared-process model even with hang-proofing because
+# their desync hang holds the GIL. The CleanUpOnly watchdog aborts the stuck NCCL comm, but
+# the test body is stuck in a GIL-holding call. PowerSGD spends the desync window inside its
+# SVD/orthogonalization + a python future.wait() that never yields.
+SKIP_TESTS_REASON = "known in-process hang (GIL-holding desync) -- see upstream test comments"
+SKIP_TESTS = {
+    "test_powerSGD_ddp_comm_hook_nccl": SKIP_TESTS_REASON,
+    "test_powerSGD_ddp_comm_hook_nccl_grad_is_view": SKIP_TESTS_REASON
+}
+
+
+# Tests whose premise is single node and cannot pass once ranks are genuienly on different nodes. Skipped.
+XNODE_INCOMPAT = {
+    "test_nccl_dist_backend_error": "premise = both ranks share one CUDA device (ncclInvalidUsage); cross-node they are on"
+    "different GPUs so the expected DistBackendError never raises.",
+    "test_intra_node_comm_all_reduce_custom_group_name_False": "IntraNodeComm is NVLink/same-node only.",
+    "test_intra_node_comm_all_reduce_custom_group_name_True": "IntraNodeComm is NVLink/same-node only.",
+    "test_pass_nccl_options_config": "same-node NCCL config assertion; not cross-node meaningful.",
+    "test_pass_nccl_options_config_comm_name": "same-node NCCL config assertion; not cross-node meaningful."
+}
+
+# Classes whose tests are run each in a fresh throwaway subprocess instead of in-process. ProcessGroupNCCLGroupTest
+# drives low-level PG lifecycle back-to-back in one long-lived process. This accumulates NCCL communicator state that
+# eventually double frees which leads to SIGSEGV.
+ISOLATE_CLASSES = {"ProcessGroupNCCLGroupTest"}
 
 
 def _log(*a):
@@ -321,7 +359,7 @@ def main():
         args.pg_timeout,
         args.classes,
         args.excludes,
-        args.tests
+        args.tests,
         args.pytorch_src,
         args.ref
         )
@@ -471,14 +509,12 @@ def main():
         sys.stderr.flush()
         os._exit({OK: 0, SKIP: 3, FAIL: 1}[st])
 
-    _self = os.path.abspath(__file__)
-
     def _isolated(cname):
         if args.no_isolate:
             return False
         if args.isolate:
             return True
-        return cname in ISOLATED_CLASSES
+        return cname in ISOLATE_CLASSES
 
     for idx, (cname, cls, test) in enumerate(plan):
         tag = str(idx)
@@ -488,6 +524,13 @@ def main():
             results.append((cname, test, SKIP, f"needs world {ws}. This launch has world {cross_mpth.world}"))
             continue
         # know in process incompatible individual tests
+        if test in SKIP_TESTS:
+            reason = SKIP_TESTS[test]
+            results.append((cname, test, SKIP, reason))
+            if cross_mpth.is_rank0:
+                _log(f"[SKIP] {cname}.{test}  ({reason})")
+            continue
+        # Tests whose premise is single-node.
         if test in XNODE_INCOMPAT:
             reason = XNODE_INCOMPAT[test]
             results.append((cname, test, SKIP, reason))
