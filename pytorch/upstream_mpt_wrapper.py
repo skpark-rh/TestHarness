@@ -88,6 +88,38 @@ def _log(*a):
     print(*a, flush=True)
 
 
+def _best_effort_reset(limit=10):
+    """
+    Tear down a lingering default PG (e.g. left by an abandoned/hung body) without itself hanging.
+    Destroy in a short-lived daemon thread and move on if it doesn't return.
+    """
+    if not dist.is_initialized():
+        return
+
+    def _destroy():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_destroy, daemon=True)
+    th.start()
+    th.join(limit)
+
+
+def world_size_of(cls, test):
+    """Instantiate + run setUp, then read the world_size of this specific test."""
+    inst = cls(test)
+    try:
+        inst.setUp()
+    except BaseException:
+        pass
+    try:
+        return int(inst.world_size), inst
+    except Exception:
+        return None, inst
+
+
 class StoreCoord:
     """
     Barrier + worst-status reduction across all physical ranks using only the TCPStore -- no PG,
@@ -384,18 +416,6 @@ def main():
         _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(path)} -- SKIP")
         os.exit(0)
 
-    def world_size_of(cls, test):
-        """Instantiate + run setUp, then read the world_size of this specific test."""
-        inst = cls(test)
-        try:
-            inst.setUp()
-        except BaseException:
-            pass
-        try:
-            return int(inst.world_size), inst
-        except Exception:
-            return None, inst
-
     plan = []  # (cname, cls, test)
     for cname, cls in classes:
         for test in cross_mpth.collect_tests(cls, substrings, excludes):
@@ -469,24 +489,6 @@ def main():
             setattr(mod, fname, _wrap_pg_factory(getattr(mod, fname)))
         if hasattr(mod, "c10d") and hasattr(mod.c10d, fname) and not hasattr(getattr(mod.c10d, fname), "__wrapped__"):
             setattr(mod.c10d, fname, _wrap_pg_factory(getattr(mod.c10d, fname)))
-
-    def _best_effort_reset(limit=10):
-        """
-        Tear down a lingering default PG (e.g. left by an abandoned/hung body) without itself hanging.
-        Destroy in a short-lived daemon thread and move on if it doesn't return.
-        """
-        if not dist.is_initialized():
-            return
-
-        def _destroy():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
-
-        th = threading.Thread(target=_destroy, daemon=True)
-        th.start()
-        th.join(limit)
 
     if cross_mpth.is_rank0 and args.run_single_index is None:
         _log(f"world_size={cross_mpth.world}  ({cross_mpth.local_world} proc/pod x {cross_mpth.world // max(cross_mpth.local_world, 1)} nodes)  "
