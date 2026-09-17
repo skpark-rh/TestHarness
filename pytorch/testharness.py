@@ -23,23 +23,34 @@ class CrossNodeTestHarnessBase(ABC):
         module: str,
         test_file: str | None,
         base: object,
+        class_list: list[str] | None = None,
         pytorch_src: str | None = None,
         ref: str = "main"
     ) -> None:
         self._mod_str = module
         self._test_file_pth = test_file
         self._base = base
+        self._only_classes = set(class_list) if class_list else None
+        self._classes = []
         self._pytorch_src = pytorch_src
         self._ref = ref
         self._path = None
         self._mod = None
+
+        self._discover_test_file()
+        self._import_test_module()
+        self._collect_classes()
+
+    @abstractmethod
+    def run(self):
+        raise NotImplementedError
 
     @staticmethod
     @abstractmethod
     def run_one(cls, test, tag):
         raise NotImplementedError
 
-    def discover_test_file(self) -> str:
+    def _discover_test_file(self):
         """Locate an upstream test file: explicit file -> local clone -> upstream fetch.
 
         The installed `torch` is usually a wheel (torch.__file__ lives under site-packages),
@@ -53,7 +64,7 @@ class CrossNodeTestHarnessBase(ABC):
             if not os.path.isfile(self._test_file_pth):
                 sys.exit(f"--test-file not found: {self._test_file_pth}")
             self._path = self._test_file_pth
-            return self._path
+            return
 
         # 2. an explicit local pytorch checkout (--pytorch-src / $PYTORCH_SRC).
         if self._pytorch_src:
@@ -61,7 +72,7 @@ class CrossNodeTestHarnessBase(ABC):
             if not os.path.isfile(cand):
                 sys.exit(f"--pytorch-src given but test file not found:\n  {cand}")
             self._path = cand
-            return self._path
+            return
 
         # 3. an editable/source install: torch.__file__ == <src>/torch/__init__.py, so
         #    two dirnames land on a repo root that also holds test/. (No-op for a wheel.)
@@ -69,11 +80,11 @@ class CrossNodeTestHarnessBase(ABC):
         cand = os.path.join(src_root, rel)
         if os.path.isfile(cand):
             self._path = cand
-            return self._path
+            return
 
         # 4. fall back to downloading the latest matching file straight from upstream GitHub.
         self._path = self._fetch_upstream()
-        return self._path
+        return
 
     def _fetch_upstream(self) -> str:
         """Download the latest test/distributed/<module>.py from pytorch/pytorch to a temp file.
@@ -99,7 +110,7 @@ class CrossNodeTestHarnessBase(ABC):
         _log(f"fetched upstream {self._mod_str}.py from pytorch/pytorch@{self._ref}")
         return tmp
 
-    def import_test_module(self):
+    def _import_test_module(self):
         """Import an upstream test module by file path, with test/ dirs on sys.path (as pytest would)."""
         dist_dir = os.path.dirname(os.path.abspath(self._path))
         test_dir = os.path.dirname(dist_dir)
@@ -113,19 +124,18 @@ class CrossNodeTestHarnessBase(ABC):
         spec.loader.exec_module(mod)
         self._mod = mod
 
-    def collect_classes(self, only_classes: set[str] | None):
+    def _collect_classes(self):
         """Ordered list of MultiProcContinuousTest subclasses defined in `mod` (optionally filtered)."""
-        out = []
         for name, obj in vars(self._mod).items():
             if (inspect.isclass(obj) and issubclass(obj, self._base)
                     and obj is not self._base and obj.__module__ == self._mod.__name__):
-                if only_classes and name not in only_classes:
+                if self._only_classes and name not in self._only_classes:
                     continue
-                out.append((name, obj))
-        out.sort(key=lambda kv: kv[0])
-        return out
+                self._classes.append((name, obj))
+        self._classes.sort(key=lambda kv: kv[0])
+        return
 
-    def collect_tests(self, class_obj, substrs, excludes):
+    def _collect_tests(self, class_obj, substrs, excludes):
         """Deterministic sorted test-method names for a class. Ensure the parameterized methods are expanded."""
         # Expand @parametrize template only for classes that weren't already decorated with
         # @instantiate_parametrized_tests at import. `instantiate_parametrized_tests` is not idempotent.

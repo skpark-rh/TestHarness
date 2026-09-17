@@ -31,6 +31,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.testing._internal.common_distributed import MultiProcContinuousTest, TEST_SKIPS
 
+from config import HarnessConfig
 from testharness import CrossNodeTestHarnessBase
 
 
@@ -106,6 +107,182 @@ SUITES = {
 OK, SKIP, FAIL, XFAIL = 0, 1, 2, 3
 
 class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
+    def __init__(
+            self,
+            suite: str,
+            module: str,
+            test_file: str | None = None,
+            pytorch_src: str = '',
+            ref: str = "main",
+            class_list: list[str] | None = None,
+            tests: list[str] | None = None,
+            excludes: list[str] | None = None,
+            timeout: int = 300,
+            no_poison: bool = False,
+            list_flag: bool = False
+        ) -> None:
+        super().__init__(module, test_file, MultiProcContinuousTest, class_list, pytorch_src, ref)
+
+        self._rank = int(os.environ["RANK"])
+        self._local_rank = int(os.environ["LOCAL_RANK"])
+        self._world_size = int(os.environ["WORLD_SIZE"])
+        self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", self._world_size))
+        self._is_rank0 = self._rank == 0
+
+        self._suite = SUITES[suite] if suite else None
+        self._substrings = tests or (list(self._suite["only"]) if suite and self._suite["only"] else None)
+        if self._suite:
+            excludes = sorted(set(excludes) | set(self._suite["exclude"]))
+        self._excludes = excludes
+
+        self._list_flag = list_flag
+        self._no_poison = no_poison
+        self._timeout = timeout
+
+        self._plan = []
+        self._poisoned_classes = set()
+        self._results = []  # (cname, test, status, detail)
+        self._device = None
+        self._xfail_rules = XFAIL_WHEN_1GPU_PER_POD if self._local_world == 1 else {}
+
+        if self._only_classes:
+            self._unknown = self._only_classes - {n for n, _ in self._classes}
+            if self._unknown and self._is_rank0:
+                _log(f"WARNING: unkown class name(s) ignored: {', '.join(sorted(self._unknown))}")
+        if not self._classes:
+            _log(f"no MultiProcContinuousTest classes selected in {os.path.basename(self._path)} -- SKIP")
+            sys.exit(0)
+        self._set_plan()
+        self._initialize_pg()
+        self._prime_classes()
+
+        _log(f"world_size={self._world_size}  ({self._local_world} GPU/pod x {self._world_size // max(self._local_world, 1)} nodes)    "
+             f"backend=nvshmem module={os.path.basename(self._path)}   tests={len(self._plan)}")
+
+    def _set_plan(self):
+        """Build the full ordered (class, method) plan -- identical on every rank"""
+        for cname, cls in self._classes:
+            for t in self._collect_tests(cls, self._substrings, self._excludes):
+                self._plan.append((cname, cls, t))
+
+        if self._list_flag:
+            if self._is_rank0:
+                _log(f"# {os.path.basename(self._path)}: {len(self._classes)} class(es), {len(self._plan)} test(s)")
+                cur = None
+                for c_name, _, t in self._plan:
+                    if c_name != cur:
+                        _log(f"\n{c_name}:")
+                        cur = c_name
+                    _log(f"     {t}")
+            sys.exit(0)
+
+        if not self._plan:
+            _log("no tests matched the selection -- SKIP")
+            sys.exit(0)
+
+    def _initialize_pg(self):
+        self._device = torch.device("cuda", self._local_rank)
+        torch.cuda.set_device(self._device)
+        os.environ["LOCLAL_RANK"] = str(self._local_rank) # some init paths read this
+        dist.init_process_group(
+            backend="nccl", # this is just a place holder to initialize.
+            world_size=self._world_size,
+            rank=self._rank,
+            device_id=self._self._device,
+            timeout=datetime.timedelta(seconds=self._timeout)
+        )
+        self._pg = c10d._get_default_group()
+
+    def _prime_classes(self):
+        """
+        Prime every class the way upstream harness expects its workers to be primed.
+            - cls.rank / cls.world_size = the true global rank/world (collectives depend on it)
+            - cls.pg = the shared default group
+            - device property -> cuda:LOCAL_RANK (the one cross-node fix; leaves self.rank global)
+            - class timeout honored
+        """
+        local_dev_prop = property(lambda self: torch.device("cuda", self._local_rank))
+        for _, cls in self._classes:
+            cls.rank = self._rank
+            cls.world_size = self._world_size
+            cls.pg = self._pg
+            cls.device = local_dev_prop
+            cls.timeout = datetime.timedelta(seconds=self._timeout)
+
+        return
+
+    def run(self) -> bool:
+        for cname, cls, test in self._plan:
+            # In case of poison pill tests, skip the rest of the class as the PG may be corrupted.
+            # Keep other ranks in lockstep.
+            if cname in self._poisoned_classes:
+                self._results.append((cname, test, SKIP, "poisoned: earlier test in class failed."))
+                continue
+
+            # For expected failures record XFAIL and move on without running the op. Don't execute crossnode
+            # as the errors aren't raised cleanly as the async-aborts usually hangs.
+            xr = self.xfail_reason(test, self._xfail_rules)
+            if xr:
+                self._results.append((cname, test, XFAIL, xr))
+                if self._is_rank0:
+                    _log(f"[XFAIL] {cname}.{test} (expected failure on this topology)")
+                    _log(f"    {xr}")
+                continue
+
+            dist.barrier()
+            local_status, detail = self._run_one(cls, test)
+            status = self._reduce_status(local_status, self._device)
+            self._results.append((cname, test, status, detail))
+
+            if status == FAIL:
+                if not self._no_poison:
+                    self._poisoned_classes.add(cname)
+                if self._is_rank0:
+                    _log(f"[FAIL] {cname}.{test}")
+                    if local_status == FAIL and detail:
+                        _log(detail.rstrip())
+            elif self._is_rank0:
+                _log(f"[{'PASS' if status == OK else 'SKIP'}] {cname}.{test}"
+                     + (f"  ({detail})" if status == SKIP and detail else ""))
+
+        # --- summarize on rank 0 ---
+        npass = sum(1 for r in self._results if r[2] == OK)
+        nskip = sum(1 for r in self._results if r[2] == SKIP)
+        nfail = sum(1 for r in self._results if r[2] == FAIL)
+        nxfail = sum(1 for r in self._results if r[2] == XFAIL)
+        if self._is_rank0:
+            _log("\n" + "=" * 60)
+            _log(f"CROSS-NODE UPSTREAM RUN  ({os.path.basename(self._path)})")
+            _log(f"  {npass} passed, {nfail} failed, {nxfail} xfailed, {nskip} skipped  "
+                 f"(of {len(self._results)})")
+            if nfail:
+                _log("  FAILED:")
+                for cname, test, s, _ in self._results:
+                    if s == FAIL:
+                        _log(f"    {cname}.{test}")
+            if nxfail:
+                _log("  XFAILED (expected on this topology):")
+                for cname, test, s, _ in self._results:
+                    if s == XFAIL:
+                        _log(f"    {cname}.{test}")
+            _log("ALL DONE" if nfail == 0 else "FAILURES ABOVE")
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return False if nfail else True
+
+    @staticmethod
+    def _cleanup():
+        """Tear down distributed state. Safe to call multiple times / before init."""
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.barrier()
+            except Exception:  # noqa: BLE001
+                pass
+            dist.destroy_process_group()
+
+        return
+        
     @staticmethod
     def xfail_reason(test: str, xfail_rules: dict) -> str | None:
         for key, reason in xfail_rules.items():
@@ -114,13 +291,13 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         return None
 
     @staticmethod
-    def reduce_status(local_status: int, dev: torch.device) -> int:
+    def _reduce_status(local_status: int, dev: torch.device) -> int:
         t = torch.tensor([local_status], device=dev)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         return int(t.item())
 
     @staticmethod
-    def run_one(cls, test) -> tuple[int, str]:
+    def _run_one(cls, test) -> tuple[int, str]:
         """Run a single upstream test body on this rank. Returns the status and detail."""
         try:
             cls._run_test_given_id(f"{cls.__name__}.{test}")
@@ -137,7 +314,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             return FAIL, traceback.format_exc()
 
 
-def main():
+if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description="Run upstream MultiProcContinuousTest tests across nodes")
     argparser.add_argument("--suite", choices=sorted(SUITES),
                            help="Choices: (internode, mixed, intranode, subgroup). This selects the tests" \
@@ -158,151 +335,8 @@ def main():
     argparser.add_argument("--list", action="store_true", help="List selected classes/tests and exit (rank 0 only).")
     args = argparser.parse_args()
 
-    # --- env from torchrun / entrypoint ---
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
-    is_rank0 = rank == 0
-
-    crossnode_th = CrossMultiProcContinousTH(args.module, args.test_file, MultiProcContinuousTest, args.pytorch_src, args.ref)
-    path = crossnode_th.discover_test_file()
-    suite = SUITES[args.suite] if args.suite else None
-    only_classes = set(args.classes.split(",")) if args.classes else None
-
-    substrings = (args.tests.split(",") if args.tests 
-                  else (list(suite["only"]) if suite and suite["only"] else None))
-    excludes = args.exclude.split(",") if args.exclude else []
-    if suite:
-        excludes = sorted(set(excludes) | set(suite["exclude"]))
-    excludes = excludes or None
-
-    crossnode_th.import_test_module()
-    classes = crossnode_th.collect_classes(only_classes)
-    if only_classes:
-        unknown = only_classes - {n for n, _ in classes}
-        if unknown and is_rank0:
-            _log(f"WARNING: unkown class name(s) ignored: {', '.join(sorted(unknown))}")
-    if not classes:
-        _log(f"no MultiProcContinuousTest classes selected in {os.path.basename(path)} -- SKIP")
-        os._exit(0)
-
-    # Build the full ordered (class, method) plan -- identical on every rank
-    plan = [(cname, cls, t) for (cname, cls) in classes
-            for t in crossnode_th.collect_tests(cls, substrings, excludes)]
-
-    if args.list:
-        if is_rank0:
-            _log(f"# {os.path.basename(path)}: {len(classes)} class(es), {len(plan)} test(s)")
-            cur = None
-            for cname, _, t in plan:
-                if cname != cur:
-                    _log(f"\n{cname}:")
-                    cur = cname
-                _log(f"    {t}")
-        os._exit(0)
-
-    if not plan:
-        _log("no tests matched the selection -- SKIP")
-        os._exit(0)
-
-    # --- one persistent PG spanning both nodes (env:// rendezvous via MASTER_ADDR/PORT) ---
-    dev = torch.device("cuda", local_rank)
-    torch.cuda.set_device(dev)
-    os.environ["LOCAL_RANK"] = str(local_rank) # some init paths read this
-    dist.init_process_group(
-        backend="nccl", # this is just a place holder to initialize.
-        world_size=world_size,
-        rank=rank,
-        device_id=dev,
-        timeout=datetime.timedelta(seconds=args.timeout)
-    )
-    pg = c10d._get_default_group()
-
-    # Prime every class the way upstream harness expects its workers to be primed.
-    #   - cls.rank / cls.world_size = the true global rank/world (collectives depend on it)
-    #   - cls.pg = the shared default group
-    #   - device property -> cuda:LOCAL_RANK (the one cross-node fix; leaves self.rank global)
-    #   - class timeout honored
-    local_dev_prop = property(lambda self: torch.device("cuda", local_rank))
-    for _, cls in classes:
-        cls.rank = rank
-        cls.world_size = world_size
-        cls.pg = pg
-        cls.device = local_dev_prop
-        cls.timeout = datetime.timedelta(seconds=args.timeout)
-
-    if is_rank0:
-        _log(f"world_size={world_size}  ({local_world} GPU/pod x {world_size // max(local_world,1)} nodes)   "
-             f"backend=nccl module={os.path.basename(path)}  tests={len(plan)}")
-
-    # --- barrier-synchronised dispatch loop ---
-    poisoned_classes: set[str] = set()
-    results = [] # (cname, test, status, detail)
-
-    # Tests known-unsupported on this topology is recorded as an expected failure.
-    xfail_rules = XFAIL_WHEN_1GPU_PER_POD if local_world == 1 else {}
-
-    for cname, cls, test in plan:
-        # In case of posion pill tests, skip the rest of the class as the PG may be corrupted.
-        # Keep other ranks in lockstep.
-        if cname in poisoned_classes:
-            results.append((cname, test, SKIP, "poisoned: earlier test in class failed"))
-            continue
-
-        # For expected failures record XFAIL and move on without running the op. Don't execute crossnode
-        # as the errors aren't raised cleanly as the async-aborts usually hangs.
-        xr = crossnode_th.xfail_reason(test, xfail_rules)
-        if xr:
-            results.append((cname, test, XFAIL, xr))
-            if is_rank0:
-                _log(f"[XFAIL] {cname}.{test} (expected failure on this topology)")
-                _log(f"    {xr}")
-            continue
-
-        dist.barrier()
-        local_status, detail = crossnode_th.run_one(cls, test)
-        status = crossnode_th.reduce_status(local_status, dev)
-        results.append((cname, test, status, detail))
-
-        if status == FAIL:
-            if not args.no_poison:
-                poisoned_classes.add(cname)
-            if is_rank0:
-                _log(f"[FAIL] {cname}.{test}")
-                if local_status == FAIL and detail:
-                    _log(detail.rstrip())
-        elif is_rank0:
-            _log(f"[{'PASS' if status == OK else 'SKIP'}] {cname}.{test}"
-                 + (f"  ({detail})" if status == SKIP and detail else ""))
-
-    # --- summaize on rank 0 ---
-    npass = sum(1 for r in results if r[2] == OK)
-    nskip = sum(1 for r in results if r[2] == SKIP)
-    nfail = sum(1 for r in results if r[2] == FAIL)
-    nxfail = sum(1 for r in results if r[2] == XFAIL)
-    if is_rank0:
-        _log("\n" + "=" * 60)
-        _log(f"CROSS-NODE UPSTREAM RUN  ({os.path.basename(path)})")
-        _log(f"  {npass} passed, {nfail} failed, {nxfail} xfailed, {nskip} skipped   "
-             f"(of {len(results)})")
-        if nfail:
-            _log("  FAILED:")
-            for cname, test, s, _ in results:
-                if s == FAIL:
-                    _log(f"    {cname}.{test}")
-        if nxfail:
-            _log("  XFAILED (expeted on this topology):")
-            for cname, test, s, _ in results:
-                if s == XFAIL:
-                    _log(f"    {cname}.{test}")
-        _log("ALL DONE" if nfail == 0 else "FAILURES ABOVE")
-
-    sys.stdout.flush()
-    sys.stderr.flush()
+    cfg = HarnessConfig.from_b64(args.b64_cfg)
+    cn_mpcth = CrossMultiProcContinousTH(cfg)
+    passed = cn_mpcth.run()
     # Fast exit avoid teardown-time NCCL/atexit noise after results are recorded.
-    os._exit(1 if nfail else 0)
-
-
-if __name__ == "__main__":
-    main()
+    os._exit(0 if passed else 1)
