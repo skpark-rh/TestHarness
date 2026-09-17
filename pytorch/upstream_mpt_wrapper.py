@@ -39,6 +39,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.testing._internal.common_distributed import MultiProcessTestCase, TEST_SKIPS
 
+from config import HarnessConfig
 from testharness import CrossNodeTestHarnessBase
 
 
@@ -151,22 +152,30 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             no_guard,
             test_timeout,
             pg_timeout,
-            classes,
-            excludes,
-            tests,
-            pytorch_src = None,
-            ref = "main"
+            class_list: list[str],
+            excludes: list[str],
+            tests: list[str] | None,
+            pytorch_src: str | None = None,
+            ref: str = "main",
+            list_flag: bool = False,
+            run_single_idx: int | None = None,
+            timeout: int = 600,
+            no_isolate: bool = False,
+            isolate: bool = False,
+            no_poison: bool = False
         ):
-        super().__init__(module, test_file, base, pytorch_src, ref)
+        super().__init__(module, test_file, base, class_list, pytorch_src, ref)
         # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
         self._cur = {"key": "init", "n": 0}
 
         self._no_guard = no_guard
         self._test_timeout = test_timeout
         self._pg_timeout = pg_timeout
-        self._classes = classes
+        self._timeout = timeout
         self._excludes = excludes
-        self._tests = tests
+        self._tests = tests         # the same thing as substrings
+        self._substrings = tests    # the same thing as substrings
+        self._list_flag = list_flag
 
         self._rank = int(os.environ["RANK"])
         self._local_rank = int(os.environ["LOCAL_RANK"])
@@ -175,8 +184,197 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         self._master_addr = os.environ["MASTER_ADDR"]
         self._master_port = int(os.environ["MASTER_PORT"])
         self._is_rank0 = self._rank == 0
+        self._run_single_idx = run_single_idx
+        self._no_isolate = no_isolate
+        self._isolate = isolate
+        self._no_poison = no_poison
 
-    def run_one(self, cls, test, tag):
+        self._plan = []
+        self._poisoned = set()
+        self._results = []  # (cname, test, status, detail)
+
+        if self._only_classes and self._is_rank0:
+            unknown = self._only_classes - {n for n, _ in self._classes}
+            blocked = self._only_classes & BLOCK_CLASSES
+            if unknown - blocked:
+                _log(f"Warning: unknown class name(s) ignored: {', '.join(sorted(unknown - blocked))}")
+            if blocked:
+                _log(f"NOTE: blocklisted (spawn/exit-code) class(es) skipped: {', '.join(sorted(blocked))}")
+        if not self._classes and self._is_rank0:
+            _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(self._path)} -- SKIP")
+            sys.exit(0)
+
+        self._set_plan()
+        self._monkey_patch_mods()
+
+
+    def _set_plan(self):
+        for cname, cls in self._classes:
+            for test in self._collect_tests(cls):
+                self._plan.append((cname, cls, test))
+
+        if self._list_flag:
+            if self._is_rank0:
+                _log(f"# {os.path.basename(self._path)}: physical world={self._world}"
+                     f"({self._local_world} proc/pod x {self._world // max(self._local_world, 1)} nodes, {self._world} GPU/pod)")
+                cur = None
+                for cname, cls, test in self._plan:
+                    ws, _ = world_size_of(cls, test)
+                    mark = "run " if ws == self._world else f"skip(w={ws})"
+                    if cname != cur:
+                        _log(f"\n{cname}:")
+                        cur = cname
+                    _log(f"    [{mark}] {test}")
+            sys.exit(0)
+        return
+
+    def _monkey_patch_mods(self):
+        """
+        One extra persistent cross-node TCPStore on rank0, port = MASTER_PORT + 1 so it never clashes with
+        torchrun's own env:// store on MASTER_PORT. Both control (status/barrier) and every test's rendevous
+        ride this store via disjoint PrefixStores.
+        """
+        # Clamp every test PG's timeout so a desynced collective raises fast.
+        _pg_to = datetime.timedelta(seconds=self._pg_timeout)
+        def _clamp_timeout(kwargs):
+            t = kwargs.get("timeout")
+            if t is None or not isinstance(t, datetime.timedelta) or t > datetime.timedelta(seconds=_pg_to):
+                kwargs["timeout"] = _pg_to # will this scope cause issues???
+            return kwargs
+
+        def _wrap_pg_factory(orig):
+            @functools.wraps(orig)
+            def wrapped(*args, **kwargs):
+                return orig(*args, **_clamp_timeout(kwargs))
+            return wrapped
+
+        store_is_master = self._is_rank0 and self._run_single_idx is None
+        self._base_store = dist.TCPStore(
+            self._master_addr,
+            self._master_port + 1,
+            world_size=self._world,
+            is_master=store_is_master,
+            timeout=datetime.timedelta(seconds=self._timeout)
+        )
+        self._coord = StoreCoord(dist.PrefixStore("ctrl", self._base_store), self._rank, self._world, self._timeout)
+
+        for target in (dist, c10d):
+            target.FileStore = self._patched_filestore
+        # the test module may hold its own reference (import torch.distributed as c10d /from ... import)
+        if hasattr(self._mod, "c10d"):
+            self._mod.c10d.FileStore = self._patched_filestore
+        if hasattr(self._mod, "FileStore"):
+            self._mod.FileStore = self._patched_filestored
+
+        for target in (dist, c10d):
+            for fname in ("init_process_group", "new_group"):
+                fn = getattr(target, fname, None)
+                if fn is not None and not hasattr(fn, "__wrapped__"):
+                    setattr(target ,fname, _wrap_pg_factory(fn))
+        # the test module may hold its own reference in at import time
+        for fname in ("init_process_group", "new_group"):
+            if hasattr(self._mod, fname):
+                setattr(self._mod, fname, _wrap_pg_factory(getattr(self._mod, fname)))
+            if hasattr(self._mod, "c10d") and hasattr(self._mod.c10d, fname) and not hasattr(getattr(self._mod.c10d, fname), "__wrapped__"):
+                setattr(self._mod.c10d, fname, _wrap_pg_factory(getattr(self._mod.c10d, fname)))
+        if store_is_master:
+            _log(f"world_size={self._world}  ({self._local_world} proc/pod x {self._world // max(self._local_world, 1)} nodes)  "
+                 f"backend=nccl  module={os.path.basename(self._path)}  candidate_tests={len(self._plan)}")
+        return
+
+    def _patched_filestore(self, file_name=None, world_size=1, *args, **kwargs):
+        self._cur["n"] += 1
+        return dist.PrefixStore(f"rdzv/{self._cur['key']}/{self._cur['n']}", self._base_store)
+
+    def run(self):
+        if self._run_single_idx is not None:
+            if self._run_single_idx < 0 or self._run_single_idx >= len(self._plan):
+                _log(f"isolated child: index {self._run_single_idx} out of range (plan has {len(self._plan)})")
+                sys.exit(1)
+            _, cls_c, test_c = self._plan[self._run_single_idx]
+            status, detail = self._run_one(cls_c, test_c, str(self._run_single_idx))
+            if status == FAIL and detail:
+                _log(detail.rstrip())
+            sys.stdout.flush()
+            sys.stderr.flush()
+            return {OK: 0, SKIP: 3, FAIL: 1}[status]
+
+        for idx, (cname, cls, test) in enumerate(self._plan):
+            tag = str(idx)
+            # eligibility (deterministic + identical on every rank -> locksetp): declared world must match.
+            ws, _ = world_size_of(cls, test)
+            if ws != self._world:
+                self._results.append((cname, test, SKIP, f"needs world {ws}. This launch has world {self._world}"))
+                continue
+            # know in process incompatible individual tests
+            if test in SKIP_TESTS:
+                reason = SKIP_TESTS[test]
+                self._results.append((cname, test, SKIP, reason))
+                if self._is_rank0:
+                    _log(f"[SKIP] {cname}.{test}  ({reason})")
+                continue
+            # Tests whose premise is single-node
+            if test in XNODE_INCOMPAT:
+                reason = XNODE_INCOMPAT[test]
+                self._results.append((cname, test, SKIP, reason))
+                if self._is_rank0:
+                    _log(f"[SKIP] {cname}.{test}  ({reason})")
+                continue
+            # source-level guard: a body that pokes the spawn machiner can't run in-process
+            try:
+                src = inspect.getsource(getattr(cls, test))
+                if any(m in src for m in SKIP_SOURCE_MARKERS):
+                    self._results.append((cname, test, SKIP, "uses multi-process spawn/exit-code machinery"))
+                    continue
+            except Exception:
+                pass
+            if cname in self._poisoned:
+                self._results.append((cname, test, SKIP, "poisoned: earlier test in class failed."))
+                continue
+
+            _best_effort_reset()      # clear any default PG a prior hung body abandoned
+            self._coord.barrier(f"pre/{tag}")
+            if self._isolated(cname):
+                local_status, detail = self._run_isolated_child(idx)
+            else:
+                local_status, detail = self._run_one_guarded(cls, test, tag)
+            status = self._coord.max_status(tag, local_status)   # worst outcome on any rank governs
+            self._results.append((cname, test, status, detail))
+
+            if status == FAIL:
+                if self._no_poison:
+                    self._poisoned.add(cname)
+                if self._is_rank0:
+                    _log(f"[FAIL] {cname}.{test}")
+                    if local_status == FAIL and detail:
+                        _log(detail.rstrip())
+            elif self._is_rank0:
+                _log(f"[{'PASS' if status == OK else 'SKIP'}] {cname}.{test}"
+                     + (f"  ({detail})" if status == SKIP and detail else ""))
+
+        npass, nskip, nfail = 0, 0, 0
+        for r in self._results:
+            if r[2] == OK:
+                npass += 1
+            if r[2] == SKIP:
+                nskip += 1
+            if r[2] == FAIL:
+                nfail += 1
+        if self._is_rank0:
+            _log("\n" + "=" * 60)
+            _log(f"CROSS-NODE UPSTREAM MultiPorcessTestCase RUN  ({os.path.basname(self._path)}, world {self._world})")
+            _log(f"  {npass} passed, {nfail} failed, {nskip} skipped   (of {len(self._results)})")
+            if nfail:
+                _log("  FAILED:")
+                for cname, test, s, _ in self._results:
+                    if s == FAIL:
+                        _log(f"    {cname}.{test}")
+            _log("ALL DONE" if nfail == 0 else "FAILURES ABOVE")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return 1 if nfail else 0
+
+    def _run_one(self, cls, test, tag):
         """Run one upstream test body on this rank.  Returns (status, detail)."""
         env_snapshot = dict(os.environ)
         inst = cls(test)
@@ -220,7 +418,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             os.environ.clear()
             os.environ.update(env_snapshot)
 
-    def run_one_guarded(self, cls, test, tag):
+    def _run_one_guarded(self, cls, test, tag):
         """
         This is run_one with a per-test wall-clock backstop. The PG-timeout clamp + CleanUpOnly watchdog should
         turn any collective desync into a fast catchable FAIL inside run_one.  This guard covers the residual case
@@ -231,11 +429,11 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         control barrier (whose timeout is strictly larger).
         """
         if self._no_guard:
-            return self.run_one(cls, test,tag)
+            return self._run_one(cls, test,tag)
         box = {}
 
         def target():
-            box["r"] = self.run_one(cls, test, tag)
+            box["r"] = self._run_one(cls, test, tag)
 
         th = threading.Thread(target=target, daemon=True)
         th.start()
@@ -244,7 +442,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             return FAIL, f"HANG: body did not return within {self._test_timeout}s wall-clock (rank {self._rank})"
         return box.get("r", (FAIL, "test thread produced no result"))
 
-    def run_isolated_child(self, idx):
+    def _run_isolated_child(self, idx):
         """
         Run plan[idx] in a fresh throwaway subprocess and map its exit code to (status, detail). The
         child rebuilds the identical plan (sam module/class/test/exclude filters are forwarded) so
@@ -283,6 +481,14 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if rc < 0:
             return FAIL, f"CRASH: isolated child killed by signal {-rc} (rank {self._rank})"
         return FAIL, f"isolated child exit code {rc} (rank {self._rank})"
+
+    @staticmethod
+    def _isolated(self, cname):
+        if self._no_isolate:
+            return False
+        if self._isolate:
+            return True
+        return cname in ISOLATE_CLASSES
     
     @property
     def rank(self):
@@ -382,6 +588,8 @@ def main():
     MultiProcessTestCase._start_processes = lambda self, proc: None
     MultiProcessTestCase._join_processes = lambda self, fn: None
 
+    cfg = HarnessConfig.from_b64(args.b64_cfg)
+    # cross_mpth = CrossMultiProcessTH(cfg)
     cross_mpth = CrossMultiProcessTH(
         args.module,
         args.test_file,
@@ -393,202 +601,15 @@ def main():
         args.excludes,
         args.tests,
         args.pytorch_src,
-        args.ref
+        args.ref,
+        args.list,
+        args.run_single_index,
+        args.timeout
         )
 
     torch.cuda.set_device(cross_mpth.local_rank)
-
-    path = cross_mpth.discover_test_file()
-    only_classes = set(args.classes.split(",")) if args.classes else None
-    substrings = args.tests.split(",") if args.tests else None
-    excludes = args.excludes.split(",") if args.excludes else None
-
-    mod = cross_mpth.import_test_module()
-    classes = cross_mpth.collect_classes(only_classes)
-    if only_classes and cross_mpth.is_rank0:
-        unknown = only_classes - {n for n, _ in classes}
-        blocked = only_classes & BLOCK_CLASSES
-        if unknown - blocked:
-            _log(f"Warning: unknown class name(s) ignored: {', '.join(sorted(unknown - blocked))}")
-        if blocked:
-            _log(f"NOTE: blocklisted (spawn/exit-code) class(es) skipped: {', '.join(sorted(blocked))}")
-    if not classes:
-        _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(path)} -- SKIP")
-        os.exit(0)
-
-    plan = []  # (cname, cls, test)
-    for cname, cls in classes:
-        for test in cross_mpth.collect_tests(cls, substrings, excludes):
-            plan.append(cname, cls, test)
-
-    if args.list:
-        if cross_mpth.is_rank0:
-            _log(f"# {os.path.basename(path)}: physical world={cross_mpth.world}"
-                 f"({cross_mpth.local_world} proc/pod x {cross_mpth.world // max(cross_mpth.local_world, 1)} nodes, {cross_mpth.world} GPU/pod)")
-            cur = None
-            for cname, cls, test in plan:
-                ws, _ = world_size_of(cls, test)
-                mark = "run " if ws == cross_mpth.world else f"skip(w={ws})"
-                if cname != cur:
-                    _log(f"\n{cname}:")
-                    cur = cname
-                _log(f"    [{mark}] {test}")
-        os._exit(0)
-
-    # One extra persistent cross-node TCPStore on rank0, port = MASTER_PORT + 1 so it never clashes with
-    # torchrun's own env:// store on MASTER_PORT. Both control (status/barrier) and every test's rendevous
-    # ride this store via disjoint PrefixStores.
-    store_is_master = cross_mpth.is_rank0 and args.run_single_index is None
-    base_store = dist.TCPStore(
-        cross_mpth.master_addr,
-        cross_mpth.master_port + 1,
-        world_size=cross_mpth.world,
-        is_master = store_is_master,
-        timeout = datetime.timedelta(seconds=args.timeout)
-    )
-    coord = StoreCoord(dist.PrefixStore("ctrl", base_store), cross_mpth.rank, cross_mpth.world, args.timeout)
-
-    # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
-    _cur = {"key": "init", "n": 0}
-
-    def _patched_filestore(file_name=None, world_size=-1, *args, **kwargs):
-        _cur["n"] += 1
-        return dist.PrefixStore(f'rdzv/{_cur["key"]}/{_cur["n"]}', base_store)
-
-    for target in (dist, c10d):
-        target.FileStore = _patched_filestore
-    # the test module may hold it own reference (import torch.distributed as c10d /from ... import)
-    if hasattr(mod, "c10d"):
-        mod.c10d.FileStore = _patched_filestore
-    if hasattr(mod, "FileStore"):
-        mod.FileStore = _patched_filestore
-
-    # Clamp every test PG's timeout so a desynced collective raises fast.
-    _pg_to = datetime.timedelta(seconds=args.pg_timeout)
-
-    def _clamp_timeout(kwargs):
-        t = kwargs.get("timeout")
-        if t is None or not isinstance(t, datetime.timedelta) or t > _pg_to:
-            kwargs["timeout"] = _pg_to
-        return kwargs
-
-    def _wrap_pg_factory(orig):
-        @functools.wraps(orig)
-        def wrapped(*args, **kwargs):
-            return orig(*args, **_clamp_timeout(kwargs))
-        return wrapped
-
-    for target in (dist, c10d):
-        for fname in ("init_process_group", "new_group"):
-            fn = getattr(target, fname, None)
-            if fn is not None and not hasattr(fn, "__wrapped__"):
-                setattr(target, fname, _wrap_pg_factory(fn))
-    # the test module may hold its own reference pulled in at import time
-    for fname in ("init_process_group", "new_group"):
-        if hasattr(mod, fname):
-            setattr(mod, fname, _wrap_pg_factory(getattr(mod, fname)))
-        if hasattr(mod, "c10d") and hasattr(mod.c10d, fname) and not hasattr(getattr(mod.c10d, fname), "__wrapped__"):
-            setattr(mod.c10d, fname, _wrap_pg_factory(getattr(mod.c10d, fname)))
-
-    if cross_mpth.is_rank0 and args.run_single_index is None:
-        _log(f"world_size={cross_mpth.world}  ({cross_mpth.local_world} proc/pod x {cross_mpth.world // max(cross_mpth.local_world, 1)} nodes)  "
-             f"backend=nccl  module={os.path.basename(path)}  candidate_tests={len(plan)}")
-
-    poisoned = set()
-    results = []  # (cname, test, status, detail)
-
-    # Isolated-child mode. Runs exactly one test in a throwaway process.
-    if args.run_single_index is not None:
-        idx = args.run_single_index
-        if idx < 0 or idx >= len(plan):
-            _log(f"isolated child: index {idx} out of range (plan has {len(plan)})")
-            os._exit(1)
-        _, cls_c, test_c = plan[idx]
-        st, det = cross_mpth.run_one(cls_c, test_c, str(idx))
-        if st == FAIL and det:
-            _log(det.rstrip())
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit({OK: 0, SKIP: 3, FAIL: 1}[st])
-
-    def _isolated(cname):
-        if args.no_isolate:
-            return False
-        if args.isolate:
-            return True
-        return cname in ISOLATE_CLASSES
-
-    for idx, (cname, cls, test) in enumerate(plan):
-        tag = str(idx)
-        # eligibility (deterministic + identical on every rank -> lockstep): declared world must match.
-        ws, _ = world_size_of(cls, test)
-        if ws != cross_mpth.world:
-            results.append((cname, test, SKIP, f"needs world {ws}. This launch has world {cross_mpth.world}"))
-            continue
-        # know in process incompatible individual tests
-        if test in SKIP_TESTS:
-            reason = SKIP_TESTS[test]
-            results.append((cname, test, SKIP, reason))
-            if cross_mpth.is_rank0:
-                _log(f"[SKIP] {cname}.{test}  ({reason})")
-            continue
-        # Tests whose premise is single-node.
-        if test in XNODE_INCOMPAT:
-            reason = XNODE_INCOMPAT[test]
-            results.append((cname, test, SKIP, reason))
-            if cross_mpth.is_rank0:
-                _log(f"[SKIP] {cname}.{test}  ({reason})")
-            continue
-        # source-level guard: a body that pokes the spawn machiner can't run in-process
-        try:
-            src = inspect.getsource(getattr(cls, test))
-            if any(m in src for m in SKIP_SOURCE_MARKERS):
-                results.append((cname, test, SKIP, "uses multi-process spawn/exit-code machinery"))
-                continue
-        except Exception:
-            pass
-        if cname in poisoned:
-            results.append((cname, test, SKIP, "poisoned: earlier test in class failed."))
-            continue
-
-        _best_effort_reset()        # clear any default PG a prior hung body abandoned
-        coord.barrier(f"pre/{tag}")
-        if _isolated(cname):
-            local_status, detail = cross_mpth.run_isolated_child(idx)
-        else:
-            local_status, detail = cross_mpth.run_one_guarded(cls, test, tag)
-        status = coord.max_status(tag, local_status)   # worst outcome on any rank governs
-        results.append((cname, test, status, detail))
-
-        if status == FAIL:
-            if not args.no_poison:
-                poisoned.add(cname)
-            if cross_mpth.is_rank0:
-                _log(f"[FAIL] {cname}.{test}")
-                if local_status == FAIL and detail:
-                    _log(detail.rstrip())
-        elif cross_mpth.is_rank0:
-            _log(f"[{'PASS' if status == OK else 'SKIP'}] {cname}.{test}"
-                 + (f"  ({detail})" if status == SKIP and detail else ""))
-
-    npass = sum(1 for r in results if r[2] == OK)
-    nskip = sum(1 for r in results if r[2] == SKIP)
-    nfail = sum(1 for r in results if r[2] == FAIL)
-    if cross_mpth.is_rank0:
-        _log("\n" + "=" * 60)
-        _log(f"CROSS-NODE UPSTREAM MultiProcessTestCase RUN  ({os.path.basename(path)}, world {cross_mpth.world})")
-        _log(f"  {npass} passed, {nfail} failed, {nskip} skipped   (of {len(results)})")
-        if nfail:
-            _log("  FAILED:")
-            for cname, test, s, _ in results:
-                if s == FAIL:
-                    _log(f"    {cname}.{test}")
-        _log("ALL DONE" if nfail == 0 else "FAILURES ABOVE")
-
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(1 if nfail else 0)
-
+    code = cross_mpth.run()
+    os._exit(code)
 
 if __name__ == "__main__":
     main()
