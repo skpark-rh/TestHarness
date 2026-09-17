@@ -47,7 +47,7 @@ class CrossNodeTestHarnessBase(ABC):
 
     @staticmethod
     @abstractmethod
-    def run_one(cls, test, tag):
+    def _run_one(cls, test, tag):
         raise NotImplementedError
 
     def _discover_test_file(self):
@@ -135,7 +135,7 @@ class CrossNodeTestHarnessBase(ABC):
         self._classes.sort(key=lambda kv: kv[0])
         return
 
-    def _collect_tests(self, class_obj, substrs, excludes):
+    def _collect_tests(self, class_obj):
         """Deterministic sorted test-method names for a class. Ensure the parameterized methods are expanded."""
         # Expand @parametrize template only for classes that weren't already decorated with
         # @instantiate_parametrized_tests at import. `instantiate_parametrized_tests` is not idempotent.
@@ -148,8 +148,8 @@ class CrossNodeTestHarnessBase(ABC):
         if _has_raw_template(class_obj):
             instantiate_parametrized_tests(class_obj)
         names = sorted(n for n in dir(class_obj) if n.startswith("test"))
-        if substrs:
-            names = [n for n in names if any(s in n for s in substrs)]
-        if excludes:
-            names = [n for n in names if not any(s in n for s in excludes)]
+        if self._substrings:
+            names = [n for n in names if any(s in n for s in self._substrings)]
+        if self._excludes:
+            names = [n for n in names if not any(s in n for s in self._excludes)]
         return names

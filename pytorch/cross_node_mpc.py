@@ -162,7 +162,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
     def _set_plan(self):
         """Build the full ordered (class, method) plan -- identical on every rank"""
         for cname, cls in self._classes:
-            for t in self._collect_tests(cls, self._substrings, self._excludes):
+            for t in self._collect_tests(cls):
                 self._plan.append((cname, cls, t))
 
         if self._list_flag:
@@ -211,7 +211,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
         return
 
-    def run(self) -> bool:
+    def run(self) -> int:
         for cname, cls, test in self._plan:
             # In case of poison pill tests, skip the rest of the class as the PG may be corrupted.
             # Keep other ranks in lockstep.
@@ -269,7 +269,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
         sys.stdout.flush()
         sys.stderr.flush()
-        return False if nfail else True
+        return 1 if nfail else 0
 
     @staticmethod
     def _cleanup():
@@ -337,6 +337,6 @@ if __name__ == "__main__":
 
     cfg = HarnessConfig.from_b64(args.b64_cfg)
     cn_mpcth = CrossMultiProcContinousTH(cfg)
-    passed = cn_mpcth.run()
+    code = cn_mpcth.run()
     # Fast exit avoid teardown-time NCCL/atexit noise after results are recorded.
-    os._exit(0 if passed else 1)
+    os._exit(code)
