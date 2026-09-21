@@ -365,7 +365,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             return FAIL, traceback.format_exc()
 
 
-if __name__ == "__main__":
+def main():
     argparser = argparse.ArgumentParser(description="Run upstream MultiProcContinuousTest tests across nodes")
     # argparser.add_argument("--suite", choices=sorted(SUITES),
     #                        help="Choices: (internode, mixed, intranode, subgroup). This selects the tests" \
@@ -392,3 +392,6 @@ if __name__ == "__main__":
     code = cn_mpcth.run()
     # Fast exit avoid teardown-time NCCL/atexit noise after results are recorded.
     os._exit(code)
+
+if __name__ == "__main__":
+    main()
