@@ -207,7 +207,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
                 or (expect == "multi-gpu-multi-node" and self._local_world >= 2 and nnodes >= 2))
             if not ok:
                 if self._is_rank0:
-                    _log(f"ERROR: suite '{args.suite}' expects topology: {self._suite['topology']}\n"
+                    _log(f"ERROR: suite '{self._suite}' expects topology: {self._suite['topology']}\n"
                         f"  but got world={self._world_size}, {self._local_world} GPU/pod x {nnodes} node(s).\n"
                         f"  launch it with: {self._suite['launch']}")
                 os._exit(2)
