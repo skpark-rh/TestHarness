@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "testharness"
 version = "0.1.0"
 requires-python = ">=3.10"
-depedencies = ["torch"]
+dependencies = ["torch"]
 
 [project.scripts]
 cross-node-mp = "testharness.cross_node_mp:main"
