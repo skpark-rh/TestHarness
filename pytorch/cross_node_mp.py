@@ -84,6 +84,10 @@ XNODE_INCOMPAT = {
 # eventually double frees which leads to SIGSEGV.
 ISOLATE_CLASSES = {"ProcessGroupNCCLGroupTest"}
 
+# Neutralize spawn machinery to disable the forks and no setUp can accidentally spawn.
+MultiProcessTestCase._spawn_processes = lambda self: None
+MultiProcessTestCase._start_processes = lambda self, proc: None
+MultiProcessTestCase._join_processes = lambda self, fn: None
 
 def _log(*a):
     print(*a, flush=True)
@@ -146,9 +150,9 @@ class StoreCoord:
 class CrossMultiProcessTH(CrossNodeTestHarnessBase):
     def __init__(
             self,
+            backend,
             module,
             test_file,
-            base,
             no_guard,
             test_timeout,
             pg_timeout,
@@ -164,10 +168,11 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             isolate: bool = False,
             no_poison: bool = False
         ):
-        super().__init__(module, test_file, base, class_list, pytorch_src, ref)
+        super().__init__(module, test_file, MultiProcessTestCase, class_list, pytorch_src, ref)
         # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
         self._cur = {"key": "init", "n": 0}
 
+        self._backend = backend
         self._no_guard = no_guard
         self._test_timeout = test_timeout
         self._pg_timeout = pg_timeout
@@ -521,39 +526,33 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
 
 def main():
     ap = argparse.ArgumentParser(description="Run upstream MultiProcessTestCase suites cross-node.")
-    ap.add_argument("--module", default="test_c10d_nccl",
-                    help="Upstream test module under test/distributed. Default: test_c10d_nccl")
-    ap.add_argument("--test-file", default=None, help="Absolute path to the upstream test py file. Overrides --module")
-    ap.add_argument("--classes", default=None, help="Comma separated list of class names (default: all wrappable in module).")
-    ap.add_argument("--tests", default=None, help="Comma separated substrings that runs matching test methods.")
-    ap.add_argument("--exclude", default=None, help="Comma separated substrings that skip matching test methods.")
-    ap.add_argument("--timeout", type=int, default=600,
-                    help="Control barrier / TCPStore timeout seconds. The bound that a rank waits for its peer to finish a test.")
-    ap.add_argument("--pg-timeout", type=int, default=90,
-                    help="Clamp every test process-group's timeout. This will raise with TORCH_NCCL_BLOCKING_WAIT instead of hanging.")
-    ap.add_argument("--test-timeout", type=int, default=150,
-                    help="Per-test wall clock for tests that the PG clamp can't reach. Abandon test as a hang/fail and continue. "
-                    "This fits between --pg-timeout and --timeout.")
-    ap.add_argument("--no-guard", action="store_true", help="Disalbe the per-test wall-clock thread guard.")
-    ap.add_argument("--no-poison", action="store_true", help="Run every test indepednently instead of skipping tests after a failure.")
-    ap.add_argument("--isolate", action="store_true", help="Run every test in a fresh throwawy subprocess.")
-    ap.add_argument("--no-isolate", action="store_true", help="Never isolate. Run all tests in-process for debugging.")
-    ap.add_argument("--run-single-index", type=int, default=None, help=argparse.SUPPRESS) # INTERNAL: spawned per-teset child runs plan[N] then exists with a status code
-    ap.add_argument("--list", action="store_true", help="List eligible classes/tests for current world and exits.")
-    ap.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
-                           help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
-                                "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
-    ap.add_argument("--ref", default="main",
-                           help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
-                                "source is found. Default: main (latest).")
+    # ap.add_argument("--module", default="test_c10d_nccl",
+    #                 help="Upstream test module under test/distributed. Default: test_c10d_nccl")
+    # ap.add_argument("--test-file", default=None, help="Absolute path to the upstream test py file. Overrides --module")
+    # ap.add_argument("--classes", default=None, help="Comma separated list of class names (default: all wrappable in module).")
+    # ap.add_argument("--tests", default=None, help="Comma separated substrings that runs matching test methods.")
+    # ap.add_argument("--exclude", default=None, help="Comma separated substrings that skip matching test methods.")
+    # ap.add_argument("--timeout", type=int, default=600,
+    #                 help="Control barrier / TCPStore timeout seconds. The bound that a rank waits for its peer to finish a test.")
+    # ap.add_argument("--pg-timeout", type=int, default=90,
+    #                 help="Clamp every test process-group's timeout. This will raise with TORCH_NCCL_BLOCKING_WAIT instead of hanging.")
+    # ap.add_argument("--test-timeout", type=int, default=150,
+    #                 help="Per-test wall clock for tests that the PG clamp can't reach. Abandon test as a hang/fail and continue. "
+    #                 "This fits between --pg-timeout and --timeout.")
+    # ap.add_argument("--no-guard", action="store_true", help="Disalbe the per-test wall-clock thread guard.")
+    # ap.add_argument("--no-poison", action="store_true", help="Run every test indepednently instead of skipping tests after a failure.")
+    # ap.add_argument("--isolate", action="store_true", help="Run every test in a fresh throwawy subprocess.")
+    # ap.add_argument("--no-isolate", action="store_true", help="Never isolate. Run all tests in-process for debugging.")
+    # ap.add_argument("--run-single-index", type=int, default=None, help=argparse.SUPPRESS) # INTERNAL: spawned per-teset child runs plan[N] then exists with a status code
+    # ap.add_argument("--list", action="store_true", help="List eligible classes/tests for current world and exits.")
+    # ap.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
+    #                        help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
+    #                             "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
+    # ap.add_argument("--ref", default="main",
+    #                        help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
+    #                             "source is found. Default: main (latest).")
+    ap.add_argument("--b64-cfg", type=str, help="Base 64 encoded json string of the harness config.")
     args = ap.parse_args()
-
-    # Keep the timeouts ordered. Ordered in ascending seconds
-    # 1. collective clamp (--pg-timeout) 2. wall-clock (--test-timeout) 3. control barrier (--timeout)
-    if args.test_timeout <= args.pg_timeout:
-        args.test_timeout = args.pg_timeout + 60
-    if args.timeout <= args.test_timeout:
-        args.timeout = args.test_timeout + 120
 
     # Because of the nature of the tests by MultiProcessTestCase where, the device rank and global rank is tied
     # symmetrical gpu fabric is a no go. So GPUDirect needs to be turned off and the universal PIX needs to be utilized.
@@ -583,29 +582,32 @@ def main():
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "2" # CleanUpOnly: abort comm, never tear process down
 
-    # Neutralize spawn machinery to disable the forks and no setUp can accidentally spawn.
-    MultiProcessTestCase._spawn_processes = lambda self: None
-    MultiProcessTestCase._start_processes = lambda self, proc: None
-    MultiProcessTestCase._join_processes = lambda self, fn: None
-
     cfg = HarnessConfig.from_b64(args.b64_cfg)
-    # cross_mpth = CrossMultiProcessTH(cfg)
-    cross_mpth = CrossMultiProcessTH(
-        args.module,
-        args.test_file,
-        MultiProcessTestCase,
-        args.no_guard,
-        args.test_timeout,
-        args.pg_timeout,
-        args.classes,
-        args.excludes,
-        args.tests,
-        args.pytorch_src,
-        args.ref,
-        args.list,
-        args.run_single_index,
-        args.timeout
-        )
+
+    # Keep the timeouts ordered. Ordered in ascending seconds
+    # 1. collective clamp (--pg-timeout) 2. wall-clock (--test-timeout) 3. control barrier (--timeout)
+    if cfg.test_timeout <= cfg.pg_timeout:
+        cfg.test_timeout = cfg.pg_timeout + 60
+    if cfg.timeout <= cfg.test_timeout:
+        cfg.timeout = cfg.test_timeout + 120
+    
+    cross_mpth = CrossMultiProcessTH(cfg)
+    # cross_mpth = CrossMultiProcessTH(
+    #     args.module,
+    #     args.test_file,
+    #     MultiProcessTestCase,
+    #     args.no_guard,
+    #     args.test_timeout,
+    #     args.pg_timeout,
+    #     args.classes,
+    #     args.excludes,
+    #     args.tests,
+    #     args.pytorch_src,
+    #     args.ref,
+    #     args.list,
+    #     args.run_single_index,
+    #     args.timeout
+    #     )
 
     torch.cuda.set_device(cross_mpth.local_rank)
     code = cross_mpth.run()
