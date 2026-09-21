@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testharness"
+version = "0.1.0"
+requires-python = ">=3.10"
+depedencies = ["torch"]
+
+[project.scripts]
+cross-node-mp = "testharness.cross_node_mp:main"
+cross-node-mpc = "testharness.cross_node_mpc:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
