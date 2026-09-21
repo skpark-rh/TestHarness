@@ -103,12 +103,23 @@ SUITES = {
     },
 }
 
+
+# Upstream NCCL MultiProcContinuousTest suites.
+MODULES = {
+    "test_c10d_ops_nccl": dict(min_gpus_per_pod=2, min_world=2),
+    "test_ce_colls": dict(min_gpus_per_pod=1, min_world=2),
+    "test_nccl": dict(min_gpus_per_pod=1, min_world=2),
+    "test_composability": dict(min_gpus_per_pod=2, min_world=4),
+    "test_cupy_as_tensor": dict(min_gpus_per_pod=1, min_world=2)
+}
+
 # status per test: if 0 PASS, 1 SKIP, 2 FAIL. All-reduce MAX so the WORST outcome on any rank governs.
 OK, SKIP, FAIL, XFAIL = 0, 1, 2, 3
 
 class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
     def __init__(
             self,
+            backend: str,
             suite: str,
             module: str,
             test_file: str | None = None,
@@ -129,6 +140,8 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", self._world_size))
         self._is_rank0 = self._rank == 0
 
+        self._backend = backend
+        self._suite_type = suite
         self._suite = SUITES[suite] if suite else None
         self._substrings = tests or (list(self._suite["only"]) if suite and self._suite["only"] else None)
         if self._suite:
@@ -153,6 +166,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             _log(f"no MultiProcContinuousTest classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
         self._set_plan()
+        self._profile_guard()
         self._initialize_pg()
         self._prime_classes()
 
@@ -180,6 +194,37 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             _log("no tests matched the selection -- SKIP")
             sys.exit(0)
 
+    def _profile_guard(self):
+        # --- topology guard: a suite is bound to ONE GPU placement. Refuse a mismatch so we never
+        # record a meaningless result -- e.g. peer-ptr tests clean-failing on a cross-node bucket, or
+        # DEADLOCKING in a mixed world. nnodes is inferred from world / GPUs-per-pod. ---
+        if "nvshmem" in self._backend and self._suite:
+            nnodes = self._world_size // max(self._local_world, 1)
+            expect = self._suite["expect"]
+            ok = ((expect == "single-node" and nnodes == 1)
+                or (expect == "single-node-4gpu" and nnodes == 1 and self._local_world >= 4)
+                or (expect == "1gpu-per-node" and self._local_world == 1)
+                or (expect == "multi-gpu-multi-node" and self._local_world >= 2 and nnodes >= 2))
+            if not ok:
+                if self._is_rank0:
+                    _log(f"ERROR: suite '{args.suite}' expects topology: {self._suite['topology']}\n"
+                        f"  but got world={self._world_size}, {self._local_world} GPU/pod x {nnodes} node(s).\n"
+                        f"  launch it with: {self._suite['launch']}")
+                os._exit(2)
+            if self._is_rank0:
+                _log(f"suite={self._suite_type}  ({self._suite['topology']})")
+        # NCCL preflight warn
+        elif "nccl" in self._backend:
+            prof = MODULES.get(os.path.basename(self._path).removesuffix(".py"))
+            if prof and self._is_rank0:
+                if self._local_world < prof["min_gpus_per_pod"]:
+                    _log(f"WARNING: {self._mod} needs >= {prof['min_gpus_per_pod']} GPU/pod to RUN "
+                         f"(TEST_MULTIGPU); got {self._local_world}. Most tests will self skip. Use --bucket 4gpu.")
+                if self._world_size < prof["min_world"]:
+                    _log(f"WARNING: {self._mod} needs world >={prof['min_world']}; got {self._world_size}. "
+                         f"Some tests will skip_if_lt_x_gpu.")
+        return
+
     def _initialize_pg(self):
         self._device = torch.device("cuda", self._local_rank)
         torch.cuda.set_device(self._device)
@@ -199,14 +244,20 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             - cls.rank / cls.world_size = the true global rank/world (collectives depend on it)
             - cls.pg = the shared default group
             - device property -> cuda:LOCAL_RANK (the one cross-node fix; leaves self.rank global)
+            - cls.rank_to_GPU -> {r: [LOCAL_RANK]} Every rank maps to this pod's local device.  A process
+              only builds tensors on its own device, so mapping all keys to local_rank is the move and
+              this sidesteps `init_multigpu_helper`'s single-host math.
             - class timeout honored
         """
         local_dev_prop = property(lambda self: torch.device("cuda", self._local_rank))
+        rank_to_gpu_prop = property(lambda self: {r: [self._local_rank] for r in range(self._world_size)})
         for _, cls in self._classes:
             cls.rank = self._rank
             cls.world_size = self._world_size
             cls.pg = self._pg
             cls.device = local_dev_prop
+            if "nccl" in self._backend:
+                cls.rank_to_GPU = rank_to_gpu_prop
             cls.timeout = datetime.timedelta(seconds=self._timeout)
 
         return
@@ -316,23 +367,24 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description="Run upstream MultiProcContinuousTest tests across nodes")
-    argparser.add_argument("--suite", choices=sorted(SUITES),
-                           help="Choices: (internode, mixed, intranode, subgroup). This selects the tests" \
-                           "by mechanism and enforces matching GPU placement.")
-    argparser.add_argument("--module", default="test_nvshmem", help="Upstream test module to run that is under test/distributed (e.g. test_nvshmem)")
-    argparser.add_argument("--test-file", default=None, help="Absolute path to the upstream test*.py. (Overrides --module)")
-    argparser.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
-                           help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
-                                "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
-    argparser.add_argument("--ref", default="main",
-                           help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
-                                "source is found. Default: main (latest).")
-    argparser.add_argument("--classes", default=None, help="Comma-separated list of test classes to run. (default: all in module)")
-    argparser.add_argument("--tests", default=None, help="Common list of substrings which only run matching test methods.")
-    argparser.add_argument("--exclude", default=None, help="Comma-separated list of substrings that skip matching test methods.")
-    argparser.add_argument("--timeout", type=int, default=300, help="Process group / timeout in seconds. Default: 300s")
-    argparser.add_argument("--no-poison", action="store_true", help="Do not poison the process group on test failure. Default: False")
-    argparser.add_argument("--list", action="store_true", help="List selected classes/tests and exit (rank 0 only).")
+    # argparser.add_argument("--suite", choices=sorted(SUITES),
+    #                        help="Choices: (internode, mixed, intranode, subgroup). This selects the tests" \
+    #                        "by mechanism and enforces matching GPU placement.")
+    # argparser.add_argument("--module", default="test_nvshmem", help="Upstream test module to run that is under test/distributed (e.g. test_nvshmem)")
+    # argparser.add_argument("--test-file", default=None, help="Absolute path to the upstream test*.py. (Overrides --module)")
+    # argparser.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
+    #                        help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
+    #                             "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
+    # argparser.add_argument("--ref", default="main",
+    #                        help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
+    #                             "source is found. Default: main (latest).")
+    # argparser.add_argument("--classes", default=None, help="Comma-separated list of test classes to run. (default: all in module)")
+    # argparser.add_argument("--tests", default=None, help="Common list of substrings which only run matching test methods.")
+    # argparser.add_argument("--exclude", default=None, help="Comma-separated list of substrings that skip matching test methods.")
+    # argparser.add_argument("--timeout", type=int, default=300, help="Process group / timeout in seconds. Default: 300s")
+    # argparser.add_argument("--no-poison", action="store_true", help="Do not poison the process group on test failure. Default: False")
+    # argparser.add_argument("--list", action="store_true", help="List selected classes/tests and exit (rank 0 only).")
+    argparser.add_argument("--b64-cfg", type=str, help="Base 64 encoded json string of the harness config.")
     args = argparser.parse_args()
 
     cfg = HarnessConfig.from_b64(args.b64_cfg)
