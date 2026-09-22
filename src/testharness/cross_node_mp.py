@@ -40,7 +40,7 @@ import torch.distributed.distributed_c10d as c10d
 from torch.testing._internal.common_distributed import MultiProcessTestCase, TEST_SKIPS
 
 from .config import HarnessConfig
-from .testharness import CrossNodeTestHarnessBase
+from .testharness import CrossNodeTestHarnessBase, _log
 
 
 OK, SKIP, FAIL = 0, 1, 2
@@ -88,9 +88,6 @@ ISOLATE_CLASSES = {"ProcessGroupNCCLGroupTest"}
 MultiProcessTestCase._spawn_processes = lambda self: None
 MultiProcessTestCase._start_processes = lambda self, proc: None
 MultiProcessTestCase._join_processes = lambda self, fn: None
-
-def _log(*a):
-    print(*a, flush=True)
 
 
 def _best_effort_reset(limit=10):
