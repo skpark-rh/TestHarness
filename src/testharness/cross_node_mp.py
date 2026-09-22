@@ -39,8 +39,8 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.testing._internal.common_distributed import MultiProcessTestCase, TEST_SKIPS
 
-from config import HarnessConfig
-from testharness import CrossNodeTestHarnessBase
+from .config import HarnessConfig
+from .testharness import CrossNodeTestHarnessBase
 
 
 OK, SKIP, FAIL = 0, 1, 2
