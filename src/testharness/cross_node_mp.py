@@ -115,7 +115,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             no_guard,
             test_timeout,
             pg_timeout,
-            class_list: list[str],
+            classes: list[str],
             tests: list[str] | None,
             pytorch_src: str | None = None,
             ref: str = "main",
@@ -126,7 +126,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             isolate: bool = False,
             no_poison: bool = False
         ):
-        super().__init__(module, MultiProcessTestCase, class_list, ngpus, nodes, ref, pytorch_src)
+        super().__init__(module, MultiProcessTestCase, classes, ngpus, nodes, ref, pytorch_src)
         # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
         self._cur = {"key": "init", "n": 0}
 
@@ -532,23 +532,13 @@ def main():
     if cfg.timeout <= cfg.test_timeout:
         cfg.timeout = cfg.test_timeout + 120
     
-    cross_mpth = CrossMultiProcessTH(cfg)
-    # cross_mpth = CrossMultiProcessTH(
-    #     args.module,
-    #     args.test_file,
-    #     MultiProcessTestCase,
-    #     args.no_guard,
-    #     args.test_timeout,
-    #     args.pg_timeout,
-    #     args.classes,
-    #     args.excludes,
-    #     args.tests,
-    #     args.pytorch_src,
-    #     args.ref,
-    #     args.list,
-    #     args.run_single_index,
-    #     args.timeout
-    #     )
+    cross_mpth = CrossMultiProcessTH(
+        module=cfg.module, ngpus=cfg.ngpus, nodes=cfg.nodes,
+        no_guard=cfg.no_guard, test_timeout=cfg.test_timeout, pg_timeout=cfg.pg_timeout,
+        classes=cfg.classes, tests=cfg.tests, pytorch_src=cfg.pytorch_src, ref=cfg.ref,
+        list_flag=cfg.list_flag, run_single_idx=cfg.run_single_idx, timeout=cfg.timeout,
+        no_isolate=cfg.no_isolate, isolate=cfg.isolate, no_poison=cfg.no_poison
+        )
 
     torch.cuda.set_device(cross_mpth.local_rank)
     code = cross_mpth.run()

@@ -48,12 +48,12 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             nodes: int,
             pytorch_src: str = '',
             ref: str = "main",
-            class_list: list[str] | None = None,
+            classes: list[str] | None = None,
             timeout: int = 300,
             no_poison: bool = False,
             list_flag: bool = False
         ) -> None:
-        super().__init__(module, MultiProcContinuousTest, class_list, ngpus, nodes, ref, pytorch_src)
+        super().__init__(module, MultiProcContinuousTest, classes, ngpus, nodes, ref, pytorch_src)
 
         self._rank = int(os.environ["RANK"])
         self._local_rank = int(os.environ["LOCAL_RANK"])
@@ -265,7 +265,13 @@ def main():
     args = argparser.parse_args()
 
     cfg = HarnessConfig.from_b64(args.b64_cfg)
-    cn_mpcth = CrossMultiProcContinousTH(cfg)
+    cn_mpcth = CrossMultiProcContinousTH(
+        module=cfg.module, ngpus=cfg.ngpus, nodes=cfg.nodes,
+        pytorch_src=cfg.pytorch_src, ref=cfg.ref,
+        classes=cfg.classes,
+        timeout=cfg.timeout, no_poison=cfg.no_poison,
+        list_flag=cfg.list_flag
+        )
     code = cn_mpcth.run()
     # Fast exit avoid teardown-time NCCL/atexit noise after results are recorded.
     os._exit(code)

@@ -30,7 +30,7 @@ class HarnessConfig:
     pg_timeout: int = 90
     isolate: bool = False    # This seems to be a redundant flag.
     no_isolate: bool = False # why is there two???
-    run_single_index: int | None = None  # internal test
+    run_single_idx: int | None = None  # internal test
 
     # transport
     def to_b64(self) -> str:
