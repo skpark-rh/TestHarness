@@ -33,82 +33,9 @@ from torch.testing._internal.common_distributed import MultiProcContinuousTest, 
 
 from .config import HarnessConfig
 from .testharness import CrossNodeTestHarnessBase, _log
+from .skips.nvshmem import XFAIL_WHEN_1GPU_PER_POD, SUITES
+from .skips.nccl import MODULES
 
-
-# Transport/topology suits
-# Certain nvshmem test are only valid with specific gpu placement. The tests are grouped accordingly.
-#   internode --bucket 2gpu (1 GPU/pod x N nodes; every peer hop = NIC / IBRC-IBGDA)
-#   mixed     --bucket 4gpu (2 GPU/pod x N nodes; P2P same-node + RDMA cross-node)
-#   intranode intranode-nvlink.yml (2 GPU, signle node; NVLINK load/store)
-#   subgroup  subgroup-nvlink.yml (4 GPU, single node)
-
-# nvshmem_ptr() load/store + NVLS multicast. Need this with NVSWITCH capabilities.
-NVLINK_ONLY = ["get_remote", "multicast_ptr", "tile_reduce", "multi_root",
-               "one_shot", "multimem"] # one_shot + multimem is in test_symmetric_memory
-NEEDS_4_LOCAL_GPU = ["subgroup"]
-
-# currently test_get is failing on 2 nodes, 1 GPU/pod.
-XFAIL_WHEN_1GPU_PER_POD = {
-    # "test_get": (
-    #     "symm_mem.get() into a non-symmetric (unregistered) local dst is unsupported cross-node "
-    #     "(NVSHMEM getmem needs a registered local MR -> ibrc WC status 4, LOC_PROT_ERR). Passes "
-    #     "where the peer is P2P-reachable. Upstream op bug in nvshmem_get_out; see the bug doc."
-    # )
-    "test_barrier": (
-        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
-    ),
-    "test_put_wait_signal": (
-        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
-    ),
-    "test_nvshmem_get": (
-        "Requires direct load/store access (NVLINK/P2P). NYI: Signaling network-connected peers."
-    )
-}
-
-# Asymmetric NVLS tile reduce hangs. Nee NVLS hardware. Also need NVSHMEM_MAX_TEAMS raised.
-ASYMMETRIC_TILE_REDUCE_HANGS = ["test_tile_reduce", "root_ratio_2"]
-
-SUITES = {
-    "internode": {
-        "expect": "1gpu-per-node",   # local_world_size == 1 -> every peer is remote
-        "topology": "1 GPU/pod x N nodes -- every peer hop crosses the NIC (IBRC/IBGDA)",
-        "launch": "submit-job.py --bucket 2gpu",
-        "only": None,                # all tests except the excludes below
-        "exclude": NVLINK_ONLY + NEEDS_4_LOCAL_GPU,   # test_get NOT excluded -> xfail'd at 1 GPU/pod (see dispatch)
-    },
-    "mixed": {
-        "expect": "multi-gpu-multi-node",   # local_world>=2 and nnodes>=2
-        "topology": "2 GPU/pod x N nodes -- P2P for same-node peers + RDMA cross-node",
-        "launch": "submit-job.py --bucket 4gpu",
-        "only": None,
-        "exclude": NVLINK_ONLY + NEEDS_4_LOCAL_GPU,   # peer-ptr would DEADLOCK; NVLS would crash
-    },
-    "intranode": {
-        "expect": "single-node",     # nnodes == 1 -> peers are NVLink-reachable
-        "topology": "2+ GPU, SINGLE node -- NVLink/NVSwitch load/store domain",
-        "launch": "crossnode/intranode-nvlink.yml (torchrun --standalone --nnodes=1 --nproc_per_node=2)",
-        "only": NVLINK_ONLY,         # run ONLY the NVLink-domain ops here
-        "exclude": NEEDS_4_LOCAL_GPU + ASYMMETRIC_TILE_REDUCE_HANGS,
-    },
-    "subgroup": {
-        "expect": "single-node-4gpu",   # nnodes == 1 AND local_world >= 4
-        "topology": "4 GPU, SINGLE node -- DispatchCombineInSubgroups splits WORLD into "
-                    ">=2 subgroups, so it needs >=4 local devices (skip_if_lt_x_gpu(4))",
-        "launch": "crossnode/subgroup-nvlink.yml (torchrun --standalone --nnodes=1 --nproc_per_node=4)",
-        "only": NEEDS_4_LOCAL_GPU,   # run ONLY the >=4-GPU subgroup test(s)
-        "exclude": [],               # nothing else -- this is the one topology that CAN run them
-    },
-}
-
-
-# Upstream NCCL MultiProcContinuousTest suites.
-MODULES = {
-    "test_c10d_ops_nccl": dict(min_gpus_per_pod=2, min_world=2),
-    "test_ce_colls": dict(min_gpus_per_pod=1, min_world=2),
-    "test_nccl": dict(min_gpus_per_pod=1, min_world=2),
-    "test_composability": dict(min_gpus_per_pod=2, min_world=4),
-    "test_cupy_as_tensor": dict(min_gpus_per_pod=1, min_world=2)
-}
 
 # status per test: if 0 PASS, 1 SKIP, 2 FAIL. All-reduce MAX so the WORST outcome on any rank governs.
 OK, SKIP, FAIL, XFAIL = 0, 1, 2, 3
@@ -116,20 +43,17 @@ OK, SKIP, FAIL, XFAIL = 0, 1, 2, 3
 class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
     def __init__(
             self,
-            backend: str,
-            suite: str,
             module: str,
-            test_file: str | None = None,
+            ngpus: int,
+            nodes: int,
             pytorch_src: str = '',
             ref: str = "main",
             class_list: list[str] | None = None,
-            tests: list[str] | None = None,
-            excludes: list[str] | None = None,
             timeout: int = 300,
             no_poison: bool = False,
             list_flag: bool = False
         ) -> None:
-        super().__init__(module, test_file, MultiProcContinuousTest, class_list, pytorch_src, ref)
+        super().__init__(module, MultiProcContinuousTest, class_list, ngpus, nodes, ref, pytorch_src)
 
         self._rank = int(os.environ["RANK"])
         self._local_rank = int(os.environ["LOCAL_RANK"])
@@ -137,23 +61,14 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", self._world_size))
         self._is_rank0 = self._rank == 0
 
-        self._backend = backend
-        self._suite_type = suite
-        self._suite = SUITES[suite] if suite else None
-        self._substrings = tests or (list(self._suite["only"]) if suite and self._suite["only"] else None)
-        if self._suite:
-            excludes = sorted(set(excludes) | set(self._suite["exclude"]))
-        self._excludes = excludes
-
         self._list_flag = list_flag
         self._no_poison = no_poison
         self._timeout = timeout
 
-        self._plan = []
+        # self._plan = []
         self._poisoned_classes = set()
         self._results = []  # (cname, test, status, detail)
         self._device = None
-        self._xfail_rules = XFAIL_WHEN_1GPU_PER_POD if self._local_world == 1 else {}
 
         if self._only_classes:
             self._unknown = self._only_classes - {n for n, _ in self._classes}
@@ -162,7 +77,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         if not self._classes:
             _log(f"no MultiProcContinuousTest classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
-        self._set_plan()
+        # self._set_plan()
         self._profile_guard()
         self._initialize_pg()
         self._prime_classes()
@@ -170,48 +85,30 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         _log(f"world_size={self._world_size}  ({self._local_world} GPU/pod x {self._world_size // max(self._local_world, 1)} nodes)    "
              f"backend=nvshmem module={os.path.basename(self._path)}   tests={len(self._plan)}")
 
-    def _set_plan(self):
-        """Build the full ordered (class, method) plan -- identical on every rank"""
-        for cname, cls in self._classes:
-            for t in self._collect_tests(cls):
-                self._plan.append((cname, cls, t))
+    # def _set_plan(self):
+    #     """Build the full ordered (class, method) plan -- identical on every rank"""
+    #     for cname, cls in self._classes:
+    #         for t in self._collect_tests(cls):
+    #             self._plan.append((cname, cls, t))
 
-        if self._list_flag:
-            if self._is_rank0:
-                _log(f"# {os.path.basename(self._path)}: {len(self._classes)} class(es), {len(self._plan)} test(s)")
-                cur = None
-                for c_name, _, t in self._plan:
-                    if c_name != cur:
-                        _log(f"\n{c_name}:")
-                        cur = c_name
-                    _log(f"     {t}")
-            sys.exit(0)
+        # if self._list_flag:
+        #     if self._is_rank0:
+        #         _log(f"# {os.path.basename(self._path)}: {len(self._classes)} class(es), {len(self._plan)} test(s)")
+        #         cur = None
+        #         for c_name, _, t in self._plan:
+        #             if c_name != cur:
+        #                 _log(f"\n{c_name}:")
+        #                 cur = c_name
+        #             _log(f"     {t}")
+        #     sys.exit(0)
 
-        if not self._plan:
-            _log("no tests matched the selection -- SKIP")
-            sys.exit(0)
+        # if not self._plan:
+        #     _log("no tests matched the selection -- SKIP")
+        #     sys.exit(0)
 
     def _profile_guard(self):
-        # --- topology guard: a suite is bound to ONE GPU placement. Refuse a mismatch so we never
-        # record a meaningless result -- e.g. peer-ptr tests clean-failing on a cross-node bucket, or
-        # DEADLOCKING in a mixed world. nnodes is inferred from world / GPUs-per-pod. ---
-        if "nvshmem" in self._backend and self._suite:
-            nnodes = self._world_size // max(self._local_world, 1)
-            expect = self._suite["expect"]
-            ok = ((expect == "single-node" and nnodes == 1)
-                or (expect == "single-node-4gpu" and nnodes == 1 and self._local_world >= 4)
-                or (expect == "1gpu-per-node" and self._local_world == 1)
-                or (expect == "multi-gpu-multi-node" and self._local_world >= 2 and nnodes >= 2))
-            if not ok:
-                if self._is_rank0:
-                    _log(f"ERROR: suite '{self._suite}' expects topology: {self._suite['topology']}\n"
-                        f"  but got world={self._world_size}, {self._local_world} GPU/pod x {nnodes} node(s).\n"
-                        f"  launch it with: {self._suite['launch']}")
-                os._exit(2)
-            if self._is_rank0:
-                _log(f"suite={self._suite_type}  ({self._suite['topology']})")
         # NCCL preflight warn
-        elif "nccl" in self._backend:
+        if "nccl" in self._backend:
             prof = MODULES.get(os.path.basename(self._path).removesuffix(".py"))
             if prof and self._is_rank0:
                 if self._local_world < prof["min_gpus_per_pod"]:
@@ -267,16 +164,6 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
                 self._results.append((cname, test, SKIP, "poisoned: earlier test in class failed."))
                 continue
 
-            # For expected failures record XFAIL and move on without running the op. Don't execute crossnode
-            # as the errors aren't raised cleanly as the async-aborts usually hangs.
-            xr = self.xfail_reason(test, self._xfail_rules)
-            if xr:
-                self._results.append((cname, test, XFAIL, xr))
-                if self._is_rank0:
-                    _log(f"[XFAIL] {cname}.{test} (expected failure on this topology)")
-                    _log(f"    {xr}")
-                continue
-
             dist.barrier()
             local_status, detail = self._run_one(cls, test)
             status = self._reduce_status(local_status, self._device)
@@ -330,13 +217,6 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             dist.destroy_process_group()
 
         return
-        
-    @staticmethod
-    def xfail_reason(test: str, xfail_rules: dict) -> str | None:
-        for key, reason in xfail_rules.items():
-            if key in test:
-                return reason
-        return None
 
     @staticmethod
     def _reduce_status(local_status: int, dev: torch.device) -> int:

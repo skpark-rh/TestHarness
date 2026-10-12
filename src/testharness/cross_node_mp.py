@@ -41,48 +41,10 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase, TES
 
 from .config import HarnessConfig
 from .testharness import CrossNodeTestHarnessBase, _log
+from .skips.nccl import BLOCK_CLASSES, SKIP_SOURCE_MARKERS, SKIP_TESTS, ISOLATE_CLASSES
 
 
 OK, SKIP, FAIL = 0, 1, 2
-
-# Classes whose PASS/FAIL is defined by real multi-process spawn semantics. (Child exit codes,
-# SIGABRT from watchdog, flight-recorder dumps). This is not runnable on one-process-per-rank. Skipped.
-BLOCK_CLASSES = {
-    "NCCLTraceTest", "NCCLTraceTestBase", "NCCLTraceTestDumpOnTimeoutBase",
-    "NCCLTraceTestDumpOnTimeout", "NCCLTraceTestDumpOnStuckRanks",
-    "NCCLTraceTestManyRanks", "NcclErrorHandlingTest"
-}
-# Test whose body reaches into the spawn machinery cant' run in-process. Skipped.
-SKIP_SOURCE_MARKERS = (
-    "self.processes", "_check_return_codes", "special_return_code_checks",
-    "skip_return_code_checks", "self._spawn_processes"
-)
-
-# Individual tests that cannot run in the shared-process model even with hang-proofing because
-# their desync hang holds the GIL. The CleanUpOnly watchdog aborts the stuck NCCL comm, but
-# the test body is stuck in a GIL-holding call. PowerSGD spends the desync window inside its
-# SVD/orthogonalization + a python future.wait() that never yields.
-SKIP_TESTS_REASON = "known in-process hang (GIL-holding desync) -- see upstream test comments"
-SKIP_TESTS = {
-    "test_powerSGD_ddp_comm_hook_nccl": SKIP_TESTS_REASON,
-    "test_powerSGD_ddp_comm_hook_nccl_grad_is_view": SKIP_TESTS_REASON
-}
-
-
-# Tests whose premise is single node and cannot pass once ranks are genuienly on different nodes. Skipped.
-XNODE_INCOMPAT = {
-    "test_nccl_dist_backend_error": "premise = both ranks share one CUDA device (ncclInvalidUsage); cross-node they are on"
-    "different GPUs so the expected DistBackendError never raises.",
-    "test_intra_node_comm_all_reduce_custom_group_name_False": "IntraNodeComm is NVLink/same-node only.",
-    "test_intra_node_comm_all_reduce_custom_group_name_True": "IntraNodeComm is NVLink/same-node only.",
-    "test_pass_nccl_options_config": "same-node NCCL config assertion; not cross-node meaningful.",
-    "test_pass_nccl_options_config_comm_name": "same-node NCCL config assertion; not cross-node meaningful."
-}
-
-# Classes whose tests are run each in a fresh throwaway subprocess instead of in-process. ProcessGroupNCCLGroupTest
-# drives low-level PG lifecycle back-to-back in one long-lived process. This accumulates NCCL communicator state that
-# eventually double frees which leads to SIGSEGV.
-ISOLATE_CLASSES = {"ProcessGroupNCCLGroupTest"}
 
 # Neutralize spawn machinery to disable the forks and no setUp can accidentally spawn.
 MultiProcessTestCase._spawn_processes = lambda self: None
@@ -147,14 +109,13 @@ class StoreCoord:
 class CrossMultiProcessTH(CrossNodeTestHarnessBase):
     def __init__(
             self,
-            backend,
             module,
-            test_file,
+            ngpus,
+            nodes,
             no_guard,
             test_timeout,
             pg_timeout,
             class_list: list[str],
-            excludes: list[str],
             tests: list[str] | None,
             pytorch_src: str | None = None,
             ref: str = "main",
@@ -165,18 +126,15 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             isolate: bool = False,
             no_poison: bool = False
         ):
-        super().__init__(module, test_file, MultiProcessTestCase, class_list, pytorch_src, ref)
+        super().__init__(module, MultiProcessTestCase, class_list, ngpus, nodes, ref, pytorch_src)
         # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
         self._cur = {"key": "init", "n": 0}
 
-        self._backend = backend
         self._no_guard = no_guard
         self._test_timeout = test_timeout
         self._pg_timeout = pg_timeout
         self._timeout = timeout
-        self._excludes = excludes
         self._tests = tests         # the same thing as substrings
-        self._substrings = tests    # the same thing as substrings
         self._list_flag = list_flag
 
         self._rank = int(os.environ["RANK"])
@@ -191,7 +149,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         self._isolate = isolate
         self._no_poison = no_poison
 
-        self._plan = []
+        # self._plan = []
         self._poisoned = set()
         self._results = []  # (cname, test, status, detail)
 
@@ -206,29 +164,29 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
 
-        self._set_plan()
+        # self._set_plan()
         self._monkey_patch_mods()
 
 
-    def _set_plan(self):
-        for cname, cls in self._classes:
-            for test in self._collect_tests(cls):
-                self._plan.append((cname, cls, test))
+    # def _set_plan(self):
+    #     for cname, cls in self._classes:
+    #         for test in self._collect_tests(cls):
+    #             self._plan.append((cname, cls, test))
 
-        if self._list_flag:
-            if self._is_rank0:
-                _log(f"# {os.path.basename(self._path)}: physical world={self._world}"
-                     f"({self._local_world} proc/pod x {self._world // max(self._local_world, 1)} nodes, {self._world} GPU/pod)")
-                cur = None
-                for cname, cls, test in self._plan:
-                    ws, _ = world_size_of(cls, test)
-                    mark = "run " if ws == self._world else f"skip(w={ws})"
-                    if cname != cur:
-                        _log(f"\n{cname}:")
-                        cur = cname
-                    _log(f"    [{mark}] {test}")
-            sys.exit(0)
-        return
+    #     if self._list_flag:
+    #         if self._is_rank0:
+    #             _log(f"# {os.path.basename(self._path)}: physical world={self._world}"
+    #                  f"({self._local_world} proc/pod x {self._world // max(self._local_world, 1)} nodes, {self._world} GPU/pod)")
+    #             cur = None
+    #             for cname, cls, test in self._plan:
+    #                 ws, _ = world_size_of(cls, test)
+    #                 mark = "run " if ws == self._world else f"skip(w={ws})"
+    #                 if cname != cur:
+    #                     _log(f"\n{cname}:")
+    #                     cur = cname
+    #                 _log(f"    [{mark}] {test}")
+    #         sys.exit(0)
+    #     return
 
     def _monkey_patch_mods(self):
         """
@@ -307,20 +265,6 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             ws, _ = world_size_of(cls, test)
             if ws != self._world:
                 self._results.append((cname, test, SKIP, f"needs world {ws}. This launch has world {self._world}"))
-                continue
-            # know in process incompatible individual tests
-            if test in SKIP_TESTS:
-                reason = SKIP_TESTS[test]
-                self._results.append((cname, test, SKIP, reason))
-                if self._is_rank0:
-                    _log(f"[SKIP] {cname}.{test}  ({reason})")
-                continue
-            # Tests whose premise is single-node
-            if test in XNODE_INCOMPAT:
-                reason = XNODE_INCOMPAT[test]
-                self._results.append((cname, test, SKIP, reason))
-                if self._is_rank0:
-                    _log(f"[SKIP] {cname}.{test}  ({reason})")
                 continue
             # source-level guard: a body that pokes the spawn machiner can't run in-process
             try:
