@@ -12,16 +12,14 @@ BACKEND_DEFAULTS = {
 
 @dataclass
 class HarnessConfig:
-    backend: str                    # nccl_cont | nccl_mpt | nvshmem
-
     # --- common selection knobs ---
     module: str | None = None
-    test_file: str | None = None
+    ngpus: int = 1
+    nodes: int = 2
     pytorch_src: str = ""
     ref: str = "main"
     classes: list[str] | None = None
     tests: list[str] | None = None
-    excludes: list[str] | None = None
     timeout: int = 300
     no_poison: bool = False
     list_flag: bool = False
@@ -34,13 +32,10 @@ class HarnessConfig:
     no_isolate: bool = False # why is there two???
     run_single_index: int | None = None  # internal test
 
-    # --- nvshmem ---
-    suite: str | None = None
-
     # transport
     def to_b64(self) -> str:
         raw = json.dumps({f.name: getattr(self, f.name) for f in fields(self)}).encode()
-        return raw
+        return base64.b64encode(raw).decode()
 
     @classmethod
     def from_b64(cls, blob: str) -> "HarnessConfig":
