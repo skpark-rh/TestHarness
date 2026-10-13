@@ -308,7 +308,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
                 nfail += 1
         if self._is_rank0:
             _log("\n" + "=" * 60)
-            _log(f"CROSS-NODE UPSTREAM MultiPorcessTestCase RUN  ({os.path.basname(self._path)}, world {self._world})")
+            _log(f"CROSS-NODE UPSTREAM MultiPorcessTestCase RUN  ({os.path.basename(self._path)}, world {self._world})")
             _log(f"  {npass} passed, {nfail} failed, {nskip} skipped   (of {len(self._results)})")
             if nfail:
                 _log("  FAILED:")
@@ -427,7 +427,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if rc < 0:
             return FAIL, f"CRASH: isolated child killed by signal {-rc} (rank {self._rank})"
         return FAIL, f"isolated child exit code {rc} (rank {self._rank})"
-    
+
     def _isolated(self, cname):
         if self._no_isolate:
             return False

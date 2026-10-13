@@ -143,8 +143,10 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
               this sidesteps `init_multigpu_helper`'s single-host math.
             - class timeout honored
         """
-        local_dev_prop = property(lambda self: torch.device("cuda", self._local_rank))
-        rank_to_gpu_prop = property(lambda self: {r: [self._local_rank] for r in range(self._world_size)})
+        local_rank = self._local_rank
+        world_size = self._world_size
+        local_dev_prop = property(lambda self: torch.device("cuda", local_rank))
+        rank_to_gpu_prop = property(lambda self: {r: [local_rank] for r in range(world_size)})
         for _, cls in self._classes:
             cls.rank = self._rank
             cls.world_size = self._world_size
