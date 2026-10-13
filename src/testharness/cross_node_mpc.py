@@ -46,14 +46,14 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             module: str,
             ngpus: int,
             nodes: int,
-            pytorch_src: str = '',
             ref: str = "main",
+            repo: str = "pytorch",
             classes: list[str] | None = None,
             timeout: int = 300,
             no_poison: bool = False,
             list_flag: bool = False
         ) -> None:
-        super().__init__(module, MultiProcContinuousTest, classes, ngpus, nodes, ref, pytorch_src)
+        super().__init__(module, MultiProcContinuousTest, classes, ngpus, nodes, ref, repo)
 
         self._rank = int(os.environ["RANK"])
         self._local_rank = int(os.environ["LOCAL_RANK"])
@@ -267,8 +267,7 @@ def main():
     cfg = HarnessConfig.from_b64(args.b64_cfg)
     cn_mpcth = CrossMultiProcContinousTH(
         module=cfg.module, ngpus=cfg.ngpus, nodes=cfg.nodes,
-        pytorch_src=cfg.pytorch_src, ref=cfg.ref,
-        classes=cfg.classes,
+        ref=cfg.ref, repo=cfg.repo, classes=cfg.classes,
         timeout=cfg.timeout, no_poison=cfg.no_poison,
         list_flag=cfg.list_flag
         )

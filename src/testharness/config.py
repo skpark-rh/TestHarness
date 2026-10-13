@@ -16,8 +16,8 @@ class HarnessConfig:
     module: str | None = None
     ngpus: int = 1
     nodes: int = 2
-    pytorch_src: str = ""
     ref: str = "main"
+    repo: str = "pytorch"
     classes: list[str] | None = None
     tests: list[str] | None = None
     timeout: int = 300

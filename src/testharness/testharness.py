@@ -15,9 +15,9 @@ class CrossNodeTestHarnessBase(ABC):
         ngpus: int,
         nodes: int,
         ref: str = "main",
-        pytorch_src: str = ""
+        repo: str = "pytorch"
     ) -> None:
-        disc_test = DiscoverTests(module, ngpus, nodes, ref, pytorch_src)
+        disc_test = DiscoverTests(module, ngpus, nodes, ref, repo)
         self._classes = disc_test.collect_classes(base)
         self._plan = disc_test.get_tests(base)
 

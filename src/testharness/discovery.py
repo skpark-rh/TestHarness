@@ -59,7 +59,7 @@ def instantiate_parameterized_tests(generic_cls):
 
 
 class DiscoverTests:
-    UPSTREAM_RAW = "https://raw.githubusercontent.com/pytorch/pytorch/{ref}/test/distributed/{module}.py"
+    UPSTREAM_RAW = "https://raw.githubusercontent.com/{repo}/pytorch/{ref}/test/distributed/{module}.py"
 
     def __init__(
             self,
@@ -67,13 +67,13 @@ class DiscoverTests:
             ngpus: int,
             nodes: int,
             ref: str = "main",
-            pytorch_src: str = ""
+            repo: str = "pytorch"
             ):
         self._mod_name = mod_name
         self._ngpus = ngpus
         self._nodes = nodes
         self._ref = ref
-        self._pytorch_src = pytorch_src
+        self._repo = repo
         if "nccl" in mod_name:
             self._skip_tests = nccl.SKIP_TESTS
         elif "nvshmem" in mod_name:
@@ -91,7 +91,7 @@ class DiscoverTests:
         Defaults to the `main` branch. The newest test source and not the installed release.
         Override using ref.
         """
-        url = self.UPSTREAM_RAW.format(ref=self._ref, module=self._mod_name)
+        url = self.UPSTREAM_RAW.format(repo=self._repo, ref=self._ref, module=self._mod_name)
         try:
             with urllib.request.urlopen(url, timeout=30) as resp:
                 data = resp.read()
@@ -101,27 +101,18 @@ class DiscoverTests:
                 f"pytorch/pytorch@{self._ref}: HTTP {e.code} ({url})\n"
             )
         except urllib.error.URLError as e:
-            sys.exit(f"Could not reach GitHub to fetch `{self._mod_str}.py` ({url}): {e}")
+            sys.exit(f"Could not reach GitHub to fetch `{self._mod_name}.py` ({url}): {e}")
         fd, tmp = tempfile.mkstemp(prefix=f"{self._mod_name}_", suffix=".py")
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        print(f"fetched upstream {self._mod_name}.py from pytorch/pytorch@{self._ref}")
+        print(f"fetched upstream {self._mod_name}.py from {self._repo}/pytorch@{self._ref}")
         return tmp
 
     def _discover_test_file(self):
         """
         Locate an upstream test file: local clone -> upstream fetch.
         """
-        rel = os.path.join("test", "distributed", f"{self._mod_name}.py")
-
-        # 1. local clone
-        if self._pytorch_src:
-            cand = os.path.join(self._pytorch_src, rel)
-            if not os.path.isfile(cand):
-                sys.exit(f"pytorch_src given but incorrect.\n   {cand}")
-            self._path = cand
-            return
-        # 2. fetch from upstream
+        # fetch from upstream
         self._path = self._fetch_upstream()
         return
 
