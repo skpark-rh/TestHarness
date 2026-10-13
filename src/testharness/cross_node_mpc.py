@@ -127,7 +127,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             backend="nccl", # this is just a place holder to initialize.
             world_size=self._world_size,
             rank=self._rank,
-            device_id=self._self._device,
+            device_id=self._device,
             timeout=datetime.timedelta(seconds=self._timeout)
         )
         self._pg = c10d._get_default_group()
