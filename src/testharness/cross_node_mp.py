@@ -427,8 +427,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if rc < 0:
             return FAIL, f"CRASH: isolated child killed by signal {-rc} (rank {self._rank})"
         return FAIL, f"isolated child exit code {rc} (rank {self._rank})"
-
-    @staticmethod
+    
     def _isolated(self, cname):
         if self._no_isolate:
             return False

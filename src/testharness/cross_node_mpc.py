@@ -150,7 +150,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
             cls.world_size = self._world_size
             cls.pg = self._pg
             cls.device = local_dev_prop
-            if "nccl" in self._backend:
+            if "nccl" in self._mod_name:
                 cls.rank_to_GPU = rank_to_gpu_prop
             cls.timeout = datetime.timedelta(seconds=self._timeout)
 
