@@ -20,6 +20,8 @@ class CrossNodeTestHarnessBase(ABC):
         disc_test = DiscoverTests(module, ngpus, nodes, ref, repo)
         self._classes = disc_test.collect_classes(base)
         self._plan = disc_test.get_tests(base)
+        self._mod = disc_test.mod
+        self._mod_name = module
 
         self._only_classes = set(class_list) if class_list else None
         return

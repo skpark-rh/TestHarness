@@ -108,7 +108,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
     def _profile_guard(self):
         # NCCL preflight warn
-        if "nccl" in self._backend:
+        if "nccl" in self._mod_name:
             prof = MODULES.get(os.path.basename(self._path).removesuffix(".py"))
             if prof and self._is_rank0:
                 if self._local_world < prof["min_gpus_per_pod"]:

@@ -188,4 +188,8 @@ class DiscoverTests:
                     continue
                 tests.append((cname, cls, t))
         return tests
+
+    @property
+    def mod(self):
+        return self._mod
     
