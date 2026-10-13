@@ -74,6 +74,8 @@ class DiscoverTests:
         self._nodes = nodes
         self._ref = ref
         self._repo = repo
+        self._path = ""
+        self._mod = None
         if "nccl" in mod_name:
             self._skip_tests = nccl.SKIP_TESTS
         elif "nvshmem" in mod_name:
@@ -192,4 +194,8 @@ class DiscoverTests:
     @property
     def mod(self):
         return self._mod
+
+    @property
+    def path(self):
+        return self._path
     
