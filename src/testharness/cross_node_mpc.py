@@ -206,6 +206,9 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
         sys.stdout.flush()
         sys.stderr.flush()
+
+        # Synchronized teardown
+        self._cleanup()
         return 1 if nfail else 0
 
     @staticmethod

@@ -318,6 +318,12 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             _log("ALL DONE" if nfail == 0 else "FAILURES ABOVE")
         sys.stdout.flush()
         sys.stderr.flush()
+
+        # Synchronized teardown over the control store
+        try:
+            self._coord.barrier("final/teardown")
+        except Exception:  # noqa: BLE001
+            pass
         return 1 if nfail else 0
 
     def _run_one(self, cls, test, tag):
