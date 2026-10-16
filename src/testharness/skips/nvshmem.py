@@ -126,6 +126,15 @@ SKIP_TESTS = {
         "relation": lambda x, y: x or y,
         "reason": "Uses nvshmem_put_with_signal / nvshmem_wait_for_signal. NYI: signaling "
         "network-connected peers (no direct load/store across the NIC at 1 GPU/pod cross-node)."
+    },
+    "test_mempool_tensor_w_collective": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "dist.all_reduce on a symm-mem/NVLS-registered mempool tensor dispatches to the "
+        "NVLS one-shot all-reduce (nvshmemi_tile_allreduce_nvls). Cross-node the multicast ptr is "
+        "null -> device-side assert (reduce.cuh: src_v != nullptr) -> async SIGSEGV. NVLS/multicast "
+        "is NVLink-domain only; uncatchable native abort, so it must be excluded."
     }
 }
 
