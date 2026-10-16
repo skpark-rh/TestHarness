@@ -135,6 +135,29 @@ SKIP_TESTS = {
         "NVLS one-shot all-reduce (nvshmemi_tile_allreduce_nvls). Cross-node the multicast ptr is "
         "null -> device-side assert (reduce.cuh: src_v != nullptr) -> async SIGSEGV. NVLS/multicast "
         "is NVLink-domain only; uncatchable native abort, so it must be excluded."
+    },
+    "test_mempool_compute_ops": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "Calls torch.ops.symm_mem.nvshmem_broadcast on a symm-mem tensor; on this build the "
+        "NVSHMEM broadcast lowers to the NVLS multicast kernel (nvshmemi_tile_allreduce_nvls). "
+        "Cross-node the multicast ptr is null -> device-side assert -> SIGSEGV. NVLink-domain only."
+    },
+    "test_mempool_tensor_factory": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "Calls torch.ops.symm_mem.nvshmem_broadcast on a symm-mem tensor; on this build the "
+        "NVSHMEM broadcast lowers to the NVLS multicast kernel (nvshmemi_tile_allreduce_nvls). "
+        "Cross-node the multicast ptr is null -> device-side assert -> SIGSEGV. NVLink-domain only."
+    },
+    "test_team_pool_released_on_process_group_destroy": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "Calls torch.ops.symm_mem.tile_reduce (NVLS tile reduce). Cross-node the multicast "
+        "ptr is null -> device-side assert (reduce.cuh: src_v != nullptr) -> SIGSEGV. NVLink-domain only."
     }
 }
 
