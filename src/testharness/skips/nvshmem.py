@@ -108,6 +108,24 @@ SKIP_TESTS = {
         "nodes": lambda x: x > 1,
         "relation": lambda x, y: x or y,
         "reason": "Needs NVLS hardware. Currently only testable through single node via NVLINK."
+    },
+    # NOTE: these two match by op, not by name -- the NVLS/signaling keyword is in the test BODY,
+    # not the method name, so the substring skip above would miss them and they run cross-node.
+    "test_cuda_graph_collective": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "Captures torch.ops.symm_mem.one_shot_all_reduce (NVLS/multicast, NVLink-domain only) "
+        "into a CUDA graph. Cross-node the multicast ptr is null -> device-side illegal memory access, "
+        "surfaced at the NVSHMEM host barrier (barrier.cu) -> SIGSEGV. Unrecoverable native CUDA-context "
+        "abort; cannot be caught/xfailed in-process, so it must be excluded."
+    },
+    "test_nvshmem_put": {
+        "ngpus": lambda x: x == 1,
+        "nodes": lambda x: x > 1,
+        "relation": lambda x, y: x or y,
+        "reason": "Uses nvshmem_put_with_signal / nvshmem_wait_for_signal. NYI: signaling "
+        "network-connected peers (no direct load/store across the NIC at 1 GPU/pod cross-node)."
     }
 }
 
