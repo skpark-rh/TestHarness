@@ -279,6 +279,10 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
                 continue
 
             _best_effort_reset()      # clear any default PG a prior hung body abandoned
+            
+            if self._is_rank0:
+                _log(f"[RUN] {cname}.{test}")
+            
             self._coord.barrier(f"pre/{tag}")
             if self._isolated(cname):
                 local_status, detail = self._run_isolated_child(idx)

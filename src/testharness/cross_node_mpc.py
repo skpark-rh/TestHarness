@@ -166,6 +166,9 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
                 self._results.append((cname, test, SKIP, "poisoned: earlier test in class failed."))
                 continue
 
+            if self._is_rank0:
+                _log(f"[RUN] {cname}.{test}")
+
             dist.barrier()
             local_status, detail = self._run_one(cls, test)
             status = self._reduce_status(local_status, self._device)
