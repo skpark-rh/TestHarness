@@ -33,7 +33,6 @@ from torch.testing._internal.common_distributed import MultiProcContinuousTest, 
 
 from .config import HarnessConfig
 from .testharness import CrossNodeTestHarnessBase, _log
-from .skips.nvshmem import XFAIL_WHEN_1GPU_PER_POD, SUITES
 from .skips.nccl import MODULES
 
 
@@ -64,7 +63,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         self._list_flag = list_flag
         self._no_poison = no_poison
         self._timeout = timeout
-        
+
         self._poisoned_classes = set()
         self._results = []  # (cname, test, status, detail)
         self._device = None

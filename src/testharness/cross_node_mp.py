@@ -41,7 +41,7 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase, TES
 
 from .config import HarnessConfig
 from .testharness import CrossNodeTestHarnessBase, _log
-from .skips.nccl import BLOCK_CLASSES, SKIP_SOURCE_MARKERS, SKIP_TESTS, ISOLATE_CLASSES as nccl_IC
+from .skips.nccl import BLOCK_CLASSES, SKIP_SOURCE_MARKERS, ISOLATE_CLASSES as nccl_IC
 from .skips.nvshmem import ISOLATE_CLASSES as nvshmem_IC
 
 
@@ -159,7 +159,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if not self._classes and self._is_rank0:
             _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
-        
+
         self._monkey_patch_mods()
 
     def _monkey_patch_mods(self):
@@ -380,7 +380,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         and rendezvous-es over the same shared TCPStore.
         """
         child_argv = [
-            sys.executable, __file__,
+            sys.executable, "-m", __file__,
             "--module", self._mod_name,
             "--run-single-test", f"{cname}.{test}"
         ]
