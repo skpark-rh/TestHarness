@@ -201,3 +201,5 @@ SUITES = {
         "exclude": [],               # nothing else -- this is the one topology that CAN run them
     },
 }
+
+ISOLATE_CLASSES = {"NVSHMEMSignalNegativeTest"}

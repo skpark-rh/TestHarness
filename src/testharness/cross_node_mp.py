@@ -41,7 +41,8 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase, TES
 
 from .config import HarnessConfig
 from .testharness import CrossNodeTestHarnessBase, _log
-from .skips.nccl import BLOCK_CLASSES, SKIP_SOURCE_MARKERS, SKIP_TESTS, ISOLATE_CLASSES
+from .skips.nccl import BLOCK_CLASSES, SKIP_SOURCE_MARKERS, SKIP_TESTS, ISOLATE_CLASSES as nccl_IC
+from .skips.nvshmem import ISOLATE_CLASSES as nvshmem_IC
 
 
 OK, SKIP, FAIL = 0, 1, 2
@@ -120,7 +121,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             ref: str = "main",
             repo: str = "pytorch",
             list_flag: bool = False,
-            run_single_idx: int | None = None,
+            run_single_test: str | None = None,
             timeout: int = 600,
             no_isolate: bool = False,
             isolate: bool = False,
@@ -144,7 +145,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         self._master_addr = os.environ["MASTER_ADDR"]
         self._master_port = int(os.environ["MASTER_PORT"])
         self._is_rank0 = self._rank == 0
-        self._run_single_idx = run_single_idx
+        self._run_single_test = run_single_test
         self._no_isolate = no_isolate
         self._isolate = isolate
         self._no_poison = no_poison
@@ -208,7 +209,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
                 return orig(*args, **_clamp_timeout(kwargs))
             return wrapped
 
-        store_is_master = self._is_rank0 and self._run_single_idx is None
+        store_is_master = self._is_rank0 and self._run_single_test is None
         self._base_store = dist.TCPStore(
             self._master_addr,
             self._master_port + 1,
@@ -247,12 +248,13 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         return dist.PrefixStore(f"rdzv/{self._cur['key']}/{self._cur['n']}", self._base_store)
 
     def run(self):
-        if self._run_single_idx is not None:
-            if self._run_single_idx < 0 or self._run_single_idx >= len(self._plan):
-                _log(f"isolated child: index {self._run_single_idx} out of range (plan has {len(self._plan)})")
-                sys.exit(1)
-            _, cls_c, test_c = self._plan[self._run_single_idx]
-            status, detail = self._run_one(cls_c, test_c, str(self._run_single_idx))
+        if self._run_single_test is not None:
+            cname_c, _, test_c = self._run_single_test.partition(".")
+            cls_c = next((c for n, c in self._classes if n == cname_c), None)
+            if cls_c is None or not test_c or not hasattr(cls_c, test_c):
+                _log(f"isolated child: could not resolve test {self._run_single_test!r}")
+                return 1
+            status, detail = self._run_one(cls_c, test_c, self._run_single_test)
             if status == FAIL and detail:
                 _log(detail.rstrip())
             sys.stdout.flush()
@@ -285,7 +287,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             
             self._coord.barrier(f"pre/{tag}")
             if self._isolated(cname):
-                local_status, detail = self._run_isolated_child(idx)
+                local_status, detail = self._run_isolated_child(cname, test)
             else:
                 local_status, detail = self._run_one_guarded(cls, test, tag)
             status = self._coord.max_status(tag, local_status)   # worst outcome on any rank governs
@@ -398,22 +400,17 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             return FAIL, f"HANG: body did not return within {self._test_timeout}s wall-clock (rank {self._rank})"
         return box.get("r", (FAIL, "test thread produced no result"))
 
-    def _run_isolated_child(self, idx):
+    def _run_isolated_child(self, cname, test):
         """
-        Run plan[idx] in a fresh throwaway subprocess and map its exit code to (status, detail). The
-        child rebuilds the identical plan (sam module/class/test/exclude filters are forwarded) so
-        plan[idx] is the same test on both ranks, and rendezvous-es over the same shared TCPStore.
+        Run one named test ("<Class>.<test>") in a fresh throwaway subprocess and map its exit code
+        to (status, detail). The dchild re-emites the parent's own config with run_signle_test overriden,
+        and rendezvous-es over the same shared TCPStore.
         """
-        child_argv = [sys.executable, __file__, "--run-single-index", str(idx),
-                      "--module", self.module, "--pg-timeout", str(self._pg_timeout)]
-        if self._test_file_pth:
-            child_argv += ["--test-file", self._test_file_pth]
-        if self._classes:
-            child_argv += ["--classes", self._classes]
-        if self._tests:
-            child_argv += ["--tests", self._tests]
-        if self._exclude:
-            child_argv += ["--exclude", self._exclude]
+        child_argv = [
+            sys.executable, __file__,
+            "--module", self._mod_name,
+            "--run-single-test", f"{cname}.{test}"
+        ]
         try:
             proc = subprocess.Popen(child_argv)
         except Exception as e:   # noqa: BLE001
@@ -439,11 +436,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         return FAIL, f"isolated child exit code {rc} (rank {self._rank})"
 
     def _isolated(self, cname):
-        if self._no_isolate:
-            return False
-        if self._isolate:
-            return True
-        return cname in ISOLATE_CLASSES
+        return cname in (nccl_IC | nvshmem_IC)
     
     @property
     def rank(self):
@@ -476,32 +469,9 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
 
 def main():
     ap = argparse.ArgumentParser(description="Run upstream MultiProcessTestCase suites cross-node.")
-    # ap.add_argument("--module", default="test_c10d_nccl",
-    #                 help="Upstream test module under test/distributed. Default: test_c10d_nccl")
-    # ap.add_argument("--test-file", default=None, help="Absolute path to the upstream test py file. Overrides --module")
-    # ap.add_argument("--classes", default=None, help="Comma separated list of class names (default: all wrappable in module).")
-    # ap.add_argument("--tests", default=None, help="Comma separated substrings that runs matching test methods.")
-    # ap.add_argument("--exclude", default=None, help="Comma separated substrings that skip matching test methods.")
-    # ap.add_argument("--timeout", type=int, default=600,
-    #                 help="Control barrier / TCPStore timeout seconds. The bound that a rank waits for its peer to finish a test.")
-    # ap.add_argument("--pg-timeout", type=int, default=90,
-    #                 help="Clamp every test process-group's timeout. This will raise with TORCH_NCCL_BLOCKING_WAIT instead of hanging.")
-    # ap.add_argument("--test-timeout", type=int, default=150,
-    #                 help="Per-test wall clock for tests that the PG clamp can't reach. Abandon test as a hang/fail and continue. "
-    #                 "This fits between --pg-timeout and --timeout.")
-    # ap.add_argument("--no-guard", action="store_true", help="Disalbe the per-test wall-clock thread guard.")
-    # ap.add_argument("--no-poison", action="store_true", help="Run every test indepednently instead of skipping tests after a failure.")
-    # ap.add_argument("--isolate", action="store_true", help="Run every test in a fresh throwawy subprocess.")
-    # ap.add_argument("--no-isolate", action="store_true", help="Never isolate. Run all tests in-process for debugging.")
-    # ap.add_argument("--run-single-index", type=int, default=None, help=argparse.SUPPRESS) # INTERNAL: spawned per-teset child runs plan[N] then exists with a status code
-    # ap.add_argument("--list", action="store_true", help="List eligible classes/tests for current world and exits.")
-    # ap.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
-    #                        help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
-    #                             "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
-    # ap.add_argument("--ref", default="main",
-    #                        help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
-    #                             "source is found. Default: main (latest).")
     ap.add_argument("--b64-cfg", type=str, help="Base 64 encoded json string of the harness config.")
+    ap.add_argument("--module", type=str, default=None, help=argparse.SUPPRESS)          # isolated child only
+    ap.add_argument("--run-single-test", type=str, default=None, help=argparse.SUPPRESS) # isolated child: "<Class>.<test>"
     args = ap.parse_args()
 
     # Because of the nature of the tests by MultiProcessTestCase where, the device rank and global rank is tied
@@ -532,7 +502,10 @@ def main():
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "2" # CleanUpOnly: abort comm, never tear process down
 
-    cfg = HarnessConfig.from_b64(args.b64_cfg)
+    if args.run_single_test:
+        cfg = HarnessConfig(module=args.module, run_single_test=args.run_single_test)
+    else:
+        cfg = HarnessConfig.from_b64(args.b64_cfg)
 
     # Keep the timeouts ordered. Ordered in ascending seconds
     # 1. collective clamp (--pg-timeout) 2. wall-clock (--test-timeout) 3. control barrier (--timeout)
@@ -545,7 +518,7 @@ def main():
         module=cfg.module, ngpus=cfg.ngpus, nodes=cfg.nodes,
         no_guard=cfg.no_guard, test_timeout=cfg.test_timeout, pg_timeout=cfg.pg_timeout,
         classes=cfg.classes, tests=cfg.tests, ref=cfg.ref, repo=cfg.repo,
-        list_flag=cfg.list_flag, run_single_idx=cfg.run_single_idx, timeout=cfg.timeout,
+        list_flag=cfg.list_flag, run_single_test=cfg.run_single_test, timeout=cfg.timeout,
         no_isolate=cfg.no_isolate, isolate=cfg.isolate, no_poison=cfg.no_poison
         )
 

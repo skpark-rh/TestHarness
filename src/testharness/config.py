@@ -28,9 +28,7 @@ class HarnessConfig:
     no_guard: bool = False
     test_timeout: int = 150
     pg_timeout: int = 90
-    isolate: bool = False    # This seems to be a redundant flag.
-    no_isolate: bool = False # why is there two???
-    run_single_idx: int | None = None  # internal test
+    run_single_test: str | None = None
 
     # transport
     def to_b64(self) -> str:

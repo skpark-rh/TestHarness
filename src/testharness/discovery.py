@@ -4,6 +4,7 @@ import urllib.request
 import urllib.error
 import sys
 import tempfile
+import torch
 from importlib.util import spec_from_file_location, module_from_spec
 from functools import wraps
 from torch.testing._internal.common_distributed import MultiProcContinuousTest, MultiProcessTestCase
@@ -110,12 +111,20 @@ class DiscoverTests:
         print(f"fetched upstream {self._mod_name}.py from {self._repo}/pytorch@{self._ref}")
         return tmp
 
+    def _local_test_file(self) -> str:
+        """
+        Path to test/distributed/<module>.py in the checkout this torch was built from.
+        """
+        src_root = os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__)))
+        cand = os.path.join(src_root, "test", "distributed", f"{self._mod_name}.py")
+        return cand if os.path.isfile(cand) else None
+    
     def _discover_test_file(self):
         """
         Locate an upstream test file: local clone -> upstream fetch.
         """
         # fetch from upstream
-        self._path = self._fetch_upstream()
+        self._path = self._local_test_file() or self._fetch_upstream()
         return
 
     def _import_test_module(self):
