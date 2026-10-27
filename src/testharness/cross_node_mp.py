@@ -380,7 +380,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         and rendezvous-es over the same shared TCPStore.
         """
         child_argv = [
-            sys.executable, "-m", __file__,
+            sys.executable, "-m", __spec__.name,
             "--module", self._mod_name,
             "--run-single-test", f"{cname}.{test}"
         ]
