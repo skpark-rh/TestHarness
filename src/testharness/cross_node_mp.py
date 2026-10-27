@@ -123,8 +123,6 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             list_flag: bool = False,
             run_single_test: str | None = None,
             timeout: int = 600,
-            no_isolate: bool = False,
-            isolate: bool = False,
             no_poison: bool = False
         ):
         super().__init__(module, MultiProcessTestCase, classes, ngpus, nodes, ref, repo)
@@ -146,11 +144,8 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         self._master_port = int(os.environ["MASTER_PORT"])
         self._is_rank0 = self._rank == 0
         self._run_single_test = run_single_test
-        self._no_isolate = no_isolate
-        self._isolate = isolate
         self._no_poison = no_poison
 
-        # self._plan = []
         self._poisoned = set()
         self._results = []  # (cname, test, status, detail)
 
@@ -164,30 +159,8 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if not self._classes and self._is_rank0:
             _log(f"no wrappable MultiProcessTestCase classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
-
-        # self._set_plan()
+        
         self._monkey_patch_mods()
-
-
-    # def _set_plan(self):
-    #     for cname, cls in self._classes:
-    #         for test in self._collect_tests(cls):
-    #             self._plan.append((cname, cls, test))
-
-    #     if self._list_flag:
-    #         if self._is_rank0:
-    #             _log(f"# {os.path.basename(self._path)}: physical world={self._world}"
-    #                  f"({self._local_world} proc/pod x {self._world // max(self._local_world, 1)} nodes, {self._world} GPU/pod)")
-    #             cur = None
-    #             for cname, cls, test in self._plan:
-    #                 ws, _ = world_size_of(cls, test)
-    #                 mark = "run " if ws == self._world else f"skip(w={ws})"
-    #                 if cname != cur:
-    #                     _log(f"\n{cname}:")
-    #                     cur = cname
-    #                 _log(f"    [{mark}] {test}")
-    #         sys.exit(0)
-    #     return
 
     def _monkey_patch_mods(self):
         """
@@ -519,7 +492,7 @@ def main():
         no_guard=cfg.no_guard, test_timeout=cfg.test_timeout, pg_timeout=cfg.pg_timeout,
         classes=cfg.classes, tests=cfg.tests, ref=cfg.ref, repo=cfg.repo,
         list_flag=cfg.list_flag, run_single_test=cfg.run_single_test, timeout=cfg.timeout,
-        no_isolate=cfg.no_isolate, isolate=cfg.isolate, no_poison=cfg.no_poison
+        no_poison=cfg.no_poison
         )
 
     torch.cuda.set_device(cross_mpth.local_rank)

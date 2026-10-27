@@ -64,8 +64,7 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         self._list_flag = list_flag
         self._no_poison = no_poison
         self._timeout = timeout
-
-        # self._plan = []
+        
         self._poisoned_classes = set()
         self._results = []  # (cname, test, status, detail)
         self._device = None
@@ -77,34 +76,12 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
         if not self._classes:
             _log(f"no MultiProcContinuousTest classes selected in {os.path.basename(self._path)} -- SKIP")
             sys.exit(0)
-        # self._set_plan()
         self._profile_guard()
         self._initialize_pg()
         self._prime_classes()
 
         _log(f"world_size={self._world_size}  ({self._local_world} GPU/pod x {self._world_size // max(self._local_world, 1)} nodes)    "
              f"backend=nvshmem module={os.path.basename(self._path)}   tests={len(self._plan)}")
-
-    # def _set_plan(self):
-    #     """Build the full ordered (class, method) plan -- identical on every rank"""
-    #     for cname, cls in self._classes:
-    #         for t in self._collect_tests(cls):
-    #             self._plan.append((cname, cls, t))
-
-        # if self._list_flag:
-        #     if self._is_rank0:
-        #         _log(f"# {os.path.basename(self._path)}: {len(self._classes)} class(es), {len(self._plan)} test(s)")
-        #         cur = None
-        #         for c_name, _, t in self._plan:
-        #             if c_name != cur:
-        #                 _log(f"\n{c_name}:")
-        #                 cur = c_name
-        #             _log(f"     {t}")
-        #     sys.exit(0)
-
-        # if not self._plan:
-        #     _log("no tests matched the selection -- SKIP")
-        #     sys.exit(0)
 
     def _profile_guard(self):
         # NCCL preflight warn
@@ -252,23 +229,6 @@ class CrossMultiProcContinousTH(CrossNodeTestHarnessBase):
 
 def main():
     argparser = argparse.ArgumentParser(description="Run upstream MultiProcContinuousTest tests across nodes")
-    # argparser.add_argument("--suite", choices=sorted(SUITES),
-    #                        help="Choices: (internode, mixed, intranode, subgroup). This selects the tests" \
-    #                        "by mechanism and enforces matching GPU placement.")
-    # argparser.add_argument("--module", default="test_nvshmem", help="Upstream test module to run that is under test/distributed (e.g. test_nvshmem)")
-    # argparser.add_argument("--test-file", default=None, help="Absolute path to the upstream test*.py. (Overrides --module)")
-    # argparser.add_argument("--pytorch-src", default=os.environ.get("PYTORCH_SRC"),
-    #                        help="Path to a local pytorch checkout to pull test/distributed/<module>.py from. "
-    #                             "(default: $PYTORCH_SRC; if unset, fetches from upstream GitHub)")
-    # argparser.add_argument("--ref", default="main",
-    #                        help="Upstream git ref (branch/tag/SHA) to fetch the test file from when no local "
-    #                             "source is found. Default: main (latest).")
-    # argparser.add_argument("--classes", default=None, help="Comma-separated list of test classes to run. (default: all in module)")
-    # argparser.add_argument("--tests", default=None, help="Common list of substrings which only run matching test methods.")
-    # argparser.add_argument("--exclude", default=None, help="Comma-separated list of substrings that skip matching test methods.")
-    # argparser.add_argument("--timeout", type=int, default=300, help="Process group / timeout in seconds. Default: 300s")
-    # argparser.add_argument("--no-poison", action="store_true", help="Do not poison the process group on test failure. Default: False")
-    # argparser.add_argument("--list", action="store_true", help="List selected classes/tests and exit (rank 0 only).")
     argparser.add_argument("--b64-cfg", type=str, help="Base 64 encoded json string of the harness config.")
     args = argparser.parse_args()
 
