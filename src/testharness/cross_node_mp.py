@@ -125,7 +125,7 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
             timeout: int = 600,
             no_poison: bool = False
         ):
-        super().__init__(module, MultiProcessTestCase, classes, ngpus, nodes, ref, repo)
+        super().__init__(module, MultiProcessTestCase, classes, ngpus, nodes, ref, repo, build_plan=(run_single_test is None))
         # Patch FileStore -> PrefixStore(<per-test key>, base_store). SPMD: every rank makes the same FileStore calls in the same order.
         self._cur = {"key": "init", "n": 0}
 
@@ -224,6 +224,8 @@ class CrossMultiProcessTH(CrossNodeTestHarnessBase):
         if self._run_single_test is not None:
             cname_c, _, test_c = self._run_single_test.partition(".")
             cls_c = next((c for n, c in self._classes if n == cname_c), None)
+            if cls_c is not None:
+                self._disc.collect_tests(cls_c)
             if cls_c is None or not test_c or not hasattr(cls_c, test_c):
                 _log(f"isolated child: could not resolve test {self._run_single_test!r}")
                 return 1

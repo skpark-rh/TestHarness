@@ -15,17 +15,18 @@ class CrossNodeTestHarnessBase(ABC):
         ngpus: int,
         nodes: int,
         ref: str = "main",
-        repo: str = "pytorch"
+        repo: str = "pytorch",
+        build_plan: bool = True
     ) -> None:
         disc_test = DiscoverTests(module, ngpus, nodes, ref, repo)
+        self._disc = disc_test
         self._classes = disc_test.collect_classes(base)
-        self._plan = disc_test.get_tests(base)
+        self._plan = disc_test.get_tests(base) if build_plan else []
         self._mod = disc_test.mod
         self._path = disc_test.path
         self._mod_name = module
 
         self._only_classes = set(class_list) if class_list else None
-        return
 
     @abstractmethod
     def run(self):

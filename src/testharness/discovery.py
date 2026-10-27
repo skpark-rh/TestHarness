@@ -185,12 +185,20 @@ class DiscoverTests:
 
     def get_tests(self, base_cls):
         """Helper function that grabs tests from distributed torch test modules."""
+        def _skip_match(key, mode, t):
+            if mode == "exact":
+                return key == t
+            return key in t
+        
         tests = []
         for cname, cls in self.collect_classes(base_cls):
             for t in self.collect_tests(cls):
                 skip = False
                 for test_name, skip_dict in self._skip_tests.items():
-                    if test_name in t and skip_dict["relation"](skip_dict["ngpus"](self._ngpus), skip_dict["nodes"](self._nodes)):
+                    if (
+                        _skip_match(test_name, skip_dict.get("match", "substring"), t) and 
+                        skip_dict["relation"](skip_dict["ngpus"](self._ngpus), skip_dict["nodes"](self._nodes))
+                    ):
                         skip = True
                         reason = skip_dict["reason"]
                         print(f"[SKIP] {cname}.{t}  ({reason})")
